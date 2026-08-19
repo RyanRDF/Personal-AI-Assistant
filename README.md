@@ -37,21 +37,83 @@ Detail desain ada di [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Perbandingan 
 
 ## Persyaratan
 
+- Git.
 - Node.js 22 atau lebih baru.
 - Telegram bot token dari `@BotFather`.
 - Numeric Telegram user ID pemilik, misalnya dari `@userinfobot`.
 - OpenAI API key.
 - Opsional: Google OAuth client untuk Gmail.
 - Opsional: Brave Search API key atau Docker untuk SearXNG.
+- Untuk deployment yang direkomendasikan: Docker Engine/Desktop dengan Docker Compose v2.
 
 ## Instalasi lokal
 
+### 1. Ambil source code dan install dependency
+
 ```powershell
+git clone https://github.com/RyanRDF/Personal-AI-Assistant.git
+Set-Location Personal-AI-Assistant
+npm ci
 Copy-Item .env.example .env
-npm install
 ```
 
-Isi minimal berikut di `.env`:
+Linux/macOS:
+
+```bash
+git clone https://github.com/RyanRDF/Personal-AI-Assistant.git
+cd Personal-AI-Assistant
+npm ci
+cp .env.example .env
+```
+
+Jangan menghapus `.gitignore`. File `.env`, database, dan token lokal sudah dikecualikan dari Git.
+
+### 2. Mendapatkan `TELEGRAM_BOT_TOKEN`
+
+1. Buka [@BotFather](https://t.me/BotFather) di Telegram. Pastikan username tepat `@BotFather` dan memiliki tanda verifikasi.
+2. Kirim `/newbot`.
+3. Isi nama tampilan bot.
+4. Isi username unik yang diakhiri `bot`, misalnya `RyanPersonalAssistantBot`.
+5. BotFather akan memberikan token. Masukkan token tersebut ke `.env`:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=1234567890:token_dari_botfather
+```
+
+Token memberi kontrol penuh atas bot. Jangan masukkan token ke source code, screenshot, issue GitHub, atau commit. Jika bocor, gunakan menu bot di BotFather untuk mencabut/membuat token baru. Lihat [tutorial resmi Telegram](https://core.telegram.org/bots/tutorial).
+
+### 3. Mendapatkan `TELEGRAM_ALLOWED_USER_ID`
+
+Bot ini hanya menerima private chat dari satu numeric user ID.
+
+1. Buka [@userinfobot](https://t.me/userinfobot).
+2. Tekan **Start**.
+3. Salin nilai numeric `Id`, bukan username Telegram.
+4. Masukkan ke `.env` tanpa tanda kutip:
+
+```dotenv
+TELEGRAM_ALLOWED_USER_ID=123456789
+```
+
+### 4. Mendapatkan `OPENAI_API_KEY`
+
+1. Masuk ke [OpenAI API Platform](https://platform.openai.com/).
+2. Pilih/buat project API yang akan dipakai.
+3. Buka halaman [API keys](https://platform.openai.com/api-keys).
+4. Pilih **Create new secret key** dan gunakan project key biasa—bukan Admin API key.
+5. Salin key saat ditampilkan dan masukkan ke `.env`:
+
+```dotenv
+OPENAI_API_KEY=sk-...
+OPENAI_CHAT_MODEL=gpt-4o-mini
+OPENAI_CLASSIFIER_MODEL=gpt-4o-mini
+```
+
+Pastikan akun/project API mempunyai billing atau credit yang aktif dan model yang dipilih tersedia untuk project tersebut. API key Gemini tidak dapat dimasukkan ke `OPENAI_API_KEY`; kode saat ini menggunakan OpenAI SDK. Daftar model dapat diperiksa pada [OpenAI model catalog](https://developers.openai.com/api/docs/models). OpenAI menyarankan API key dimuat dari environment server dan tidak diekspos pada aplikasi client. Lihat [OpenAI API authentication](https://developers.openai.com/api/reference/overview#authentication).
+
+### 5. Isi konfigurasi minimal
+
+Setelah memperoleh tiga value wajib di atas, bagian minimal `.env` adalah:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=token_dari_botfather
@@ -65,50 +127,156 @@ TELEGRAM_IMAGE_MAX_BYTES=10485760
 TRACE_ENABLED_DEFAULT=false
 ```
 
-Jalankan:
+### 6. Siapkan pencarian web gratis
+
+Default project adalah SearXNG lokal. Generate secret, salin output `SEARXNG_SECRET=...` ke `.env`, lalu jalankan servicenya:
 
 ```powershell
 npm run searxng:secret
-# Salin SEARXNG_SECRET yang dicetak ke .env, lalu jalankan backend pencarian gratis:
 docker compose --profile searxng up -d searxng
+```
+
+Pastikan konfigurasi berikut tetap ada:
+
+```dotenv
+SEARCH_PROVIDER=searxng
+SEARXNG_BASE_URL=http://localhost:8080
+DOCKER_SEARXNG_BASE_URL=http://searxng:8080
+```
+
+### 7. Jalankan bot
+
+```powershell
 npm run dev
 ```
 
-Bot memakai long polling, sehingga komputer/VPS harus tetap hidup. Untuk produksi:
+Jangan menjalankan dua instance dengan token Telegram yang sama. Setelah log `Telegram bot started` muncul, buka bot, tekan **Start**, lalu coba:
 
-```powershell
-npm run build
-npm start
+```text
+/status
+/trace on
+halo
 ```
+
+Bot memakai long polling, sehingga komputer atau server harus tetap hidup. Tidak diperlukan domain publik, webhook, atau inbound port untuk Telegram.
+
+## Referensi seluruh environment variable
+
+Salin `.env.example` menjadi `.env`, lalu ubah hanya nilai yang diperlukan. Nilai kosong pada integrasi opsional boleh dibiarkan kosong.
+
+### Telegram, OpenAI, dan perilaku inti
+
+| Variable | Wajib | Cara mendapatkan / default |
+|---|---:|---|
+| `TELEGRAM_BOT_TOKEN` | Ya | Token rahasia dari `@BotFather` melalui `/newbot` |
+| `TELEGRAM_ALLOWED_USER_ID` | Ya | Numeric ID akun pemilik, misalnya dari `@userinfobot` |
+| `OPENAI_API_KEY` | Ya | Project secret key dari OpenAI API Platform |
+| `OPENAI_CHAT_MODEL` | Tidak | Model chat/vision; default `gpt-4o-mini` |
+| `OPENAI_CLASSIFIER_MODEL` | Tidak | Model klasifikasi email; default `gpt-4o-mini` |
+| `OPENAI_MAX_OUTPUT_TOKENS` | Tidak | Maksimum output; default `2000` |
+| `ASSISTANT_TIMEOUT_SECONDS` | Tidak | Timeout satu request; default `90` detik |
+| `TELEGRAM_IMAGE_MAX_BYTES` | Tidak | Maksimum ukuran gambar; default `10485760` (10 MiB) |
+| `TELEGRAM_PENDING_IMAGE_SECONDS` | Tidak | Masa simpan foto tanpa caption di RAM; default `600` |
+| `TELEGRAM_PROGRESS_UPDATE_MS` | Tidak | Interval minimum edit progress; default `1200` ms |
+| `TRACE_ENABLED_DEFAULT` | Tidak | `true`/`false`; dapat diubah per chat melalui `/trace` |
+| `DATABASE_PATH` | Tidak | SQLite lokal; default `./data/assistant.sqlite` |
+| `LOG_LEVEL` | Tidak | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, atau `silent` |
+| `TIMEZONE` | Tidak | IANA timezone; default `Asia/Jakarta` |
+| `MAX_HISTORY_MESSAGES` | Tidak | Jumlah pesan recent context; default `16` |
+| `MAX_MEMORY_ITEMS` | Tidak | Maksimum memory context; default `20` |
+| `MESSAGE_RETENTION_DAYS` | Tidak | Retensi chat dan trace; default `90` hari |
+
+### Gmail
+
+| Variable | Wajib untuk Gmail | Cara mendapatkan / default |
+|---|---:|---|
+| `GMAIL_CLIENT_ID` | Ya | OAuth 2.0 Client ID dari Google Cloud |
+| `GMAIL_CLIENT_SECRET` | Ya | OAuth 2.0 Client Secret dari client yang sama |
+| `GMAIL_REDIRECT_URI` | Ya | Harus sama persis dengan redirect URI Google; default `http://localhost:3000/oauth2callback` |
+| `GMAIL_REFRESH_TOKEN` | Ya | Dihasilkan oleh `npm run gmail:auth` setelah consent |
+| `GMAIL_POLL_SECONDS` | Tidak | Interval polling; default `120`, minimum `30` |
+| `GMAIL_MATCH_THRESHOLD` | Tidak | Confidence notifikasi semantik `0..1`; default `0.72` |
+| `GMAIL_MAX_BODY_CHARS` | Tidak | Potongan body yang dianalisis; default `6000` |
+| `EMAIL_MAX_RETRIES` | Tidak | Retry sebelum dead-letter; default `3` |
+
+### Web search
+
+| Variable | Wajib | Cara mendapatkan / default |
+|---|---:|---|
+| `SEARCH_PROVIDER` | Tidak | `searxng` (default) atau `brave` |
+| `SEARXNG_BASE_URL` | Untuk SearXNG | URL dari proses Node; default `http://localhost:8080` |
+| `DOCKER_SEARXNG_BASE_URL` | Untuk Compose | DNS internal container; default `http://searxng:8080` |
+| `SEARXNG_SECRET` | Untuk SearXNG | Generate dengan `npm run searxng:secret` |
+| `BRAVE_SEARCH_API_KEY` | Untuk Brave | API key dari Brave Search API dashboard |
+| `SEARCH_RESULT_LIMIT` | Tidak | Jumlah hasil; default `5`, maksimum `10` |
 
 ## Menghubungkan Gmail
 
-Assistant meminta scope `gmail.readonly`; aplikasi tidak dapat mengirim atau menghapus email.
+Integrasi Gmail bersifat opsional. Assistant hanya meminta scope `gmail.readonly`; aplikasi tidak dapat mengirim, mengubah, atau menghapus email.
 
-1. Buat project di Google Cloud Console.
-2. Aktifkan Gmail API.
-3. Konfigurasikan OAuth consent screen.
-4. Buat OAuth Client ID untuk desktop/local app. Pastikan redirect URI yang dipakai cocok dengan `GMAIL_REDIRECT_URI`, default `http://localhost:3000/oauth2callback`.
-5. Masukkan client ID dan client secret ke `.env`:
+### 1. Buat dan konfigurasi Google Cloud project
+
+1. Buka [Google Cloud Console](https://console.cloud.google.com/) dan buat/pilih project.
+2. Buka **APIs & Services → Library**, cari **Gmail API**, lalu pilih **Enable**.
+3. Buka **Google Auth Platform → Branding** dan isi nama aplikasi serta email kontak.
+4. Buka **Audience**, pilih **External**, dan biarkan publishing status **Testing** untuk penggunaan personal.
+5. Pada **Test users**, tambahkan alamat Gmail yang akan dihubungkan. Untuk penggunaan personal/testing, aplikasi tidak perlu dipublikasikan.
+6. Bila halaman **Data Access** meminta scope, tambahkan `https://www.googleapis.com/auth/gmail.readonly`.
+
+### 2. Buat OAuth Client ID
+
+1. Buka **Google Auth Platform → Clients** atau **APIs & Services → Credentials**.
+2. Pilih **Create OAuth client**.
+3. Pilih application type **Web application**.
+4. Pada **Authorized JavaScript origins**, biarkan kosong. Origin tidak boleh berisi path.
+5. Pada **Authorized redirect URIs**, tambahkan persis:
+
+```text
+http://localhost:3000/oauth2callback
+```
+
+6. Simpan, lalu salin Client ID dan Client Secret ke `.env`:
 
 ```dotenv
-GMAIL_CLIENT_ID=...
-GMAIL_CLIENT_SECRET=...
+GMAIL_CLIENT_ID=client-id-dari-google
+GMAIL_CLIENT_SECRET=client-secret-dari-google
 GMAIL_REDIRECT_URI=http://localhost:3000/oauth2callback
 ```
 
-6. Jalankan:
+Jika port atau path diubah, nilai di Google Console dan `GMAIL_REDIRECT_URI` harus identik.
+
+### 3. Hasilkan refresh token
+
+Jalankan di komputer lokal yang mempunyai browser dan port `3000` tersedia:
 
 ```powershell
 npm run gmail:auth
 ```
 
-7. Buka URL yang dicetak, izinkan akses, lalu salin `GMAIL_REFRESH_TOKEN` yang tampil di terminal ke `.env`.
-8. Restart bot dan cek `/status`.
+Script akan mencetak URL dan teks `Menunggu callback...`; ini normal. Buka URL tersebut di browser, login menggunakan test user yang didaftarkan, lalu:
 
-Refresh token tidak ditulis ke file oleh script dan `.env` sudah masuk `.gitignore`. Jangan mengirim atau melakukan commit terhadap credential tersebut.
+1. Jika muncul **Google hasn't verified this app**, pilih **Continue** hanya bila Anda sendiri yang membuat OAuth project tersebut.
+2. Izinkan akses read-only Gmail.
+3. Setelah browser menampilkan keberhasilan, kembali ke terminal.
+4. Salin baris refresh token yang dicetak ke `.env`:
 
-Dokumentasi resmi: [Gmail server-side OAuth](https://developers.google.com/workspace/gmail/api/auth/web-server) dan [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes).
+```dotenv
+GMAIL_REFRESH_TOKEN=refresh-token-dari-script
+```
+
+Jalankan ulang bot dan periksa `/status`. Refresh token tidak ditulis otomatis ke file dan `.env` tidak boleh di-commit.
+
+Untuk deployment, lakukan proses OAuth ini di komputer lokal terlebih dahulu, lalu salin value `.env` secara aman ke server. Script auth tidak perlu dijalankan di container production.
+
+### Troubleshooting OAuth Gmail
+
+- `Error 403: access_denied`: pastikan email yang login tercantum persis pada **Test users** dan project yang dipilih benar.
+- `Invalid Origin: URIs must not contain a path`: pindahkan URL callback ke **Authorized redirect URIs**; jangan masukkan `/oauth2callback` ke JavaScript origins.
+- Terminal berhenti pada `Menunggu callback`: buka URL yang dicetak dan selesaikan consent; terminal memang menunggu redirect browser.
+- Tidak mendapat refresh token: cabut akses aplikasi pada Google Account, pastikan login sebagai test user, lalu jalankan ulang `npm run gmail:auth`.
+- Port `3000` dipakai aplikasi lain: hentikan aplikasi tersebut atau ubah port di Google redirect URI dan `.env` secara konsisten.
+
+Google menjelaskan bahwa server-side OAuth menghasilkan authorization code yang ditukar menjadi access token dan refresh token untuk akses offline. Dokumentasi resmi: [Gmail server-side OAuth](https://developers.google.com/workspace/gmail/api/auth/web-server) dan [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes).
 
 ### Contoh pemantauan email
 
@@ -137,12 +305,16 @@ Default proyek adalah SearXNG self-hosted, sehingga tidak membutuhkan credential
 
 ### Pilihan A — Brave Search
 
-Brave saat ini memberi kredit gratis bulanan yang cukup untuk sekitar 1.000 pencarian pada harga Search API standar. Akun tetap perlu dibuat dan menurut Brave kartu digunakan untuk verifikasi anti-fraud. Lihat [Brave Search API](https://brave.com/search/api/).
+1. Buat akun pada [Brave Search API](https://brave.com/search/api/).
+2. Pilih paket yang tersedia dan buat API key dari dashboard.
+3. Masukkan key ke `.env` seperti berikut.
 
 ```dotenv
 SEARCH_PROVIDER=brave
 BRAVE_SEARCH_API_KEY=...
 ```
+
+Harga, kuota, dan persyaratan verifikasi Brave dapat berubah; periksa halaman pricing dan dashboard akun sebelum memilihnya. Perlakukan API key sebagai rahasia.
 
 ### Pilihan B — SearXNG
 
@@ -193,19 +365,9 @@ Bot mengambil resolusi foto Telegram terbesar dan mengirim gambar sebagai data U
 
 Gunakan `/trace on` untuk menampilkan tahapan, tool, durasi, model, dan penggunaan token. `/last_trace` selalu dapat menampilkan trace teknis terakhir. Trace adalah observabilitas operasional, bukan chain-of-thought internal model. Gunakan `/cancel` untuk membatalkan request aktif. Bot memakai runner concurrent agar perintah pembatalan tetap dapat diproses ketika model sedang bekerja, sementara request AI tetap dibatasi satu per chat.
 
-## Menjalankan dengan Docker
+## Verifikasi sebelum deployment
 
-```powershell
-Copy-Item .env.example .env
-npm run searxng:secret
-# Salin secret ke .env, lalu:
-docker compose --profile searxng up -d --build
-docker compose logs -f assistant
-```
-
-Database disimpan pada `./data` dan tidak masuk Git.
-
-## Pengujian
+Jalankan pemeriksaan source code terlebih dahulu:
 
 ```powershell
 npm run check
@@ -213,6 +375,148 @@ npm test
 npm run build
 npm audit
 ```
+
+Jika akan memakai Docker, validasi konfigurasi Compose setelah `.env` diisi:
+
+```powershell
+docker compose config --quiet
+```
+
+Lanjutkan dengan uji fungsional lokal:
+
+1. Jalankan `npm run dev`.
+2. Kirim `/status` untuk melihat konfigurasi model, Gmail, search, outbox, dan database.
+3. Kirim `Balas dengan kata: berhasil` untuk menguji panggilan OpenAI sebenarnya.
+4. Kirim gambar dengan caption pertanyaan untuk menguji vision.
+5. Aktifkan `/trace on`, kirim pertanyaan, lalu periksa `/last_trace`.
+6. Bila Gmail aktif, coba `Cari email terbaru dari Google` dan buat satu aturan watch percobaan.
+7. Bila search aktif, coba `Cari berita teknologi terbaru dan sertakan sumber`.
+
+`/status` memeriksa konfigurasi aplikasi, tetapi request percobaan tetap diperlukan untuk membuktikan credential remote, quota, model, dan jaringan benar-benar berfungsi.
+
+## Deployment
+
+### Pilihan A — Docker Compose (direkomendasikan)
+
+Sebelum menyalin project ke server:
+
+- Lengkapi `.env` dan uji bot secara lokal.
+- Jika Gmail digunakan, hasilkan `GMAIL_REFRESH_TOKEN` secara lokal terlebih dahulu.
+- Pastikan server dapat membuat koneksi HTTPS keluar ke Telegram, OpenAI, dan Google. Telegram long polling tidak memerlukan port masuk atau domain publik.
+- Di Linux, batasi izin file dengan `chmod 600 .env`.
+
+Untuk menjalankan assistant bersama SearXNG:
+
+```powershell
+docker compose config --quiet
+docker compose --profile searxng up -d --build
+docker compose ps
+docker compose logs --tail=100 assistant
+```
+
+Jika memakai Brave dan tidak memerlukan container SearXNG:
+
+```powershell
+docker compose up -d --build assistant
+```
+
+Buka Telegram, jalankan `/status`, lalu ulangi uji chat, image, Gmail, dan search yang digunakan. Hanya satu instance assistant boleh berjalan untuk satu token bot dan satu file database.
+
+Untuk mengambil pembaruan source dan membangun ulang:
+
+```powershell
+git pull --ff-only
+docker compose --profile searxng up -d --build
+```
+
+Perintah operasional penting:
+
+```powershell
+docker compose logs -f assistant
+docker compose stop assistant
+docker compose start assistant
+docker compose down
+```
+
+`docker compose down` menghapus container dan network, tetapi bind mount `./data` tetap berada di host. Jangan gunakan `down -v` dan jangan menghapus folder `data` bila database masih diperlukan. Dokumentasi Docker menyarankan file Compose tambahan untuk perbedaan production bila nanti Anda membutuhkan konfigurasi khusus server; lihat [Docker Compose production](https://docs.docker.com/compose/how-tos/production/).
+
+### Pilihan B — Node.js sebagai proses langsung
+
+Gunakan pilihan ini bila server tidak memakai Docker:
+
+```powershell
+npm ci
+npm run check
+npm test
+npm run build
+npm prune --omit=dev
+npm start
+```
+
+Jalankan `npm run gmail:auth` sebelum `npm prune --omit=dev`, karena script OAuth menggunakan dependency development. `npm start` harus dijaga oleh process manager atau service manager agar otomatis hidup kembali setelah crash/reboot.
+
+Contoh unit `systemd` untuk Linux—sesuaikan user, lokasi project, dan hasil `which node`:
+
+```ini
+[Unit]
+Description=Personal AI Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=personal-ai
+WorkingDirectory=/opt/personal-ai-assistant
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/personal-ai-assistant/dist/src/index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Simpan sebagai `/etc/systemd/system/personal-ai-assistant.service`, lalu:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now personal-ai-assistant
+sudo systemctl status personal-ai-assistant
+sudo journalctl -u personal-ai-assistant -f
+```
+
+### Data persisten dan backup
+
+SQLite, memori, aturan email, cursor Gmail, dan trace tersimpan pada `./data`. Untuk backup yang konsisten:
+
+1. Hentikan proses/container assistant.
+2. Salin seluruh folder `data` ke lokasi backup yang terenkripsi atau aksesnya terbatas.
+3. Jalankan kembali assistant.
+
+File `.env` juga perlu dicadangkan secara aman, terpisah dari Git. Jangan menaruhnya di image Docker, repository, chat, atau issue tracker.
+
+### Checklist setelah deployment
+
+- `.env` tidak terlacak Git dan hanya dapat dibaca oleh operator service.
+- Token/key yang pernah tampil di chat, screenshot, atau commit sudah dirotasi.
+- Hanya satu proses bot berjalan untuk token tersebut.
+- Folder `data` persisten dan mempunyai backup.
+- `/status` tidak menunjukkan konfigurasi wajib yang hilang atau dead-letter Gmail.
+- Chat teks, gambar, dan `/last_trace` berhasil.
+- Gmail search/watch berhasil bila diaktifkan.
+- Web search menghasilkan URL sumber bila diaktifkan.
+- SearXNG tetap terikat ke localhost dan tidak terbuka ke internet.
+
+## Troubleshooting runtime
+
+- Bot tidak merespons: pastikan proses masih hidup, token benar, numeric owner ID benar, chat bersifat private, dan tidak ada instance kedua dengan token yang sama.
+- Respons muncul berulang: biasanya lebih dari satu instance bot berjalan. Hentikan proses/container duplikat.
+- OpenAI `401`: key salah, dicabut, atau dimasukkan ke variable yang keliru. OpenAI `429`: periksa quota, billing, dan rate limit project.
+- Model tidak ditemukan: gunakan model yang tersedia untuk project lalu ubah `OPENAI_CHAT_MODEL` dan `OPENAI_CLASSIFIER_MODEL`.
+- Gambar tidak dijawab: periksa ukuran/format, caption atau masa tunggu gambar, model yang mendukung vision, log aplikasi, dan `/last_trace`.
+- Search SearXNG gagal: periksa `docker compose ps searxng` dan `docker compose logs searxng`; proses lokal memakai `localhost`, sedangkan container memakai nama service `searxng`.
+- Gmail tidak aktif: pastikan keempat variable Gmail terisi, refresh token masih valid, dan Gmail API tetap enabled.
+- Proses lambat: periksa trace durasi tiap tahap, koneksi jaringan, search/Gmail tool yang dipanggil, timeout, serta model. Naikkan token output hanya bila jawaban memang terpotong karena token yang lebih besar juga dapat menambah waktu dan biaya.
 
 ## Perintah Telegram
 
@@ -238,7 +542,7 @@ Selain perintah tersebut, gunakan bahasa natural untuk bertanya, menerjemahkan, 
 
 - Bot menolak semua user selain ID pemilik dan menolak group chat.
 - Gmail memakai read-only scope.
-- Email dan hasil web diberi batas sebagai untrusted data dalam prompt.
+- Email, hasil web, dan teks di dalam gambar diperlakukan sebagai untrusted data dalam prompt.
 - Tool yang mengubah memori atau aturan hanya tersedia bila klausa awal pesan pemilik secara eksplisit meminta aksi tersebut; penghapusan hanya melalui command deterministik.
 - Subject/body email tidak ditulis ke log aplikasi.
 - Riwayat dan memori tersimpan lokal di SQLite dalam bentuk plaintext; lindungi akses ke folder `data` dan disk host.

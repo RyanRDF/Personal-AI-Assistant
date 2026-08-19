@@ -12,7 +12,7 @@
 
 ### Telegram adapter
 
-`src/telegram/bot.ts` menerima update dengan long polling. Middleware pertama memverifikasi numeric owner ID dan private chat. Command deterministik ditangani langsung; pesan bebas diteruskan ke assistant.
+`src/telegram/bot.ts` menerima update teks, foto, dan dokumen gambar melalui long polling concurrent. Middleware pertama memverifikasi numeric owner ID dan private chat. Foto dengan caption langsung diteruskan sebagai input vision; foto tanpa caption hanya disimpan sementara di RAM untuk pertanyaan berikutnya. Progress edit dibatasi lajunya, request memiliki timeout, dan `/cancel` tetap responsif ketika model bekerja.
 
 ### AI orchestrator
 
@@ -25,7 +25,7 @@
 - `search_gmail`
 - `search_web`
 
-Model melakukan maksimum enam putaran tool untuk mencegah loop tanpa batas. Tool mutasi hanya dimasukkan ke request model bila klausa awal pesan pemilik memberi intent eksplisit; penghapusan memori/aturan tetap command Telegram deterministik. Semua penggunaan token ditulis ke `usage_events`.
+Model melakukan maksimum enam putaran tool untuk mencegah loop tanpa batas. Chat completion diproses secara streaming agar preview jawaban dapat ditampilkan. Tool mutasi hanya dimasukkan ke request model bila klausa awal pesan pemilik memberi intent eksplisit; penghapusan memori/aturan tetap command Telegram deterministik. Semua penggunaan token ditulis ke `usage_events`; tahap, tool, durasi, dan status request ditulis ke `request_traces` tanpa menyimpan gambar atau chain-of-thought.
 
 ### Memori
 
@@ -72,12 +72,14 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 | `email_notifications` | Persistent notification outbox dan status pengiriman |
 | `app_state` | Gmail History cursor dan state kecil lain |
 | `usage_events` | Penggunaan token per purpose/model |
+| `request_traces` | Tahap operasional, tool, durasi, status, dan token per request |
 
 ## Trust boundaries
 
 - Telegram identity adalah authorization boundary utama.
 - `.env` adalah secret boundary dan tidak masuk Git.
-- Email/web merupakan input tidak tepercaya.
+- Email, web, dan teks di dalam gambar merupakan input tidak tepercaya.
+- Gambar dikirim ke model sebagai data URL dan tidak disimpan di database atau log.
 - Subject, snippet, dan body email yang dipotong dikirim ke OpenAI untuk klasifikasi/pencarian; tidak ditulis ke log.
 - OpenAI tidak diberi tool shell, file mutation, email send, atau delete.
 - Gmail token hanya dibaca dari environment; tidak disimpan plaintext di database.

@@ -9,6 +9,10 @@ describe("configuration", () => {
     expect(config.OPENAI_CLASSIFIER_MODEL).toBe("gpt-4o-mini");
     expect(config.SEARCH_PROVIDER).toBe("searxng");
     expect(config.TIMEZONE).toBe("Asia/Jakarta");
+    expect(config.OPENAI_MAX_OUTPUT_TOKENS).toBe(2000);
+    expect(config.ASSISTANT_TIMEOUT_SECONDS).toBe(90);
+    expect(config.TELEGRAM_IMAGE_MAX_BYTES).toBe(10 * 1024 * 1024);
+    expect(config.TRACE_ENABLED_DEFAULT).toBe(false);
     expect(isGmailConfigured(config)).toBe(false);
   });
 

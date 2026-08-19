@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { run } from "@grammyjs/runner";
 import { EmailClassifier } from "./ai/email-classifier.js";
 import { PersonalAssistant } from "./ai/assistant.js";
 import { isGmailConfigured, loadConfig } from "./config.js";
@@ -9,6 +10,7 @@ import { EmailRuleService } from "./services/email-rules.js";
 import { EmailWatcher } from "./services/email-watcher.js";
 import { GmailService } from "./services/gmail.js";
 import { MemoryService } from "./services/memory.js";
+import { RequestTraceService } from "./services/request-trace.js";
 import { createSearchProvider } from "./services/web-search.js";
 import { createTelegramBot, splitTelegramMessage } from "./telegram/bot.js";
 
@@ -22,6 +24,8 @@ async function main(): Promise<void> {
     logger.info({ prunedMessages }, "Expired conversation messages deleted");
   }
   const memories = new MemoryService(database);
+  const traces = new RequestTraceService(database, config.TRACE_ENABLED_DEFAULT);
+  traces.pruneOlderThan(config.MESSAGE_RETENTION_DAYS);
   const emailRules = new EmailRuleService(database);
   const search = createSearchProvider(config);
   const gmailConfigured = isGmailConfigured(config);
@@ -40,15 +44,20 @@ async function main(): Promise<void> {
     memories,
     emailRules,
     search,
+    traces,
     gmailConfigured,
   });
 
+  await bot.init();
   await bot.api.setMyCommands([
     { command: "start", description: "Mulai dan lihat bantuan" },
     { command: "memory", description: "Lihat memori personal" },
     { command: "clear_memory", description: "Hapus semua memori (perlu konfirmasi)" },
     { command: "watches", description: "Lihat aturan email" },
     { command: "status", description: "Cek status layanan" },
+    { command: "trace", description: "Atur detail proses: /trace on atau off" },
+    { command: "last_trace", description: "Lihat trace permintaan terakhir" },
+    { command: "cancel", description: "Batalkan permintaan aktif" },
     { command: "clear_chat", description: "Hapus riwayat percakapan pendek" },
     { command: "help", description: "Lihat bantuan" },
   ]);
@@ -75,18 +84,21 @@ async function main(): Promise<void> {
     logger.warn("Gmail is not configured; email monitoring is disabled");
   }
 
+  const runner = run(bot, { sink: { concurrency: 4 } });
+  logger.info({ username: bot.botInfo.username }, "Telegram bot started");
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info({ signal }, "Shutting down");
     await watcher?.stopAndWait();
-    await bot.stop();
+    await runner.stop();
     database.close();
   };
   process.once("SIGINT", () => void shutdown("SIGINT"));
   process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
-  await bot.start({
-    onStart: (botInfo) => logger.info({ username: botInfo.username }, "Telegram bot started"),
-  });
+  await runner.task();
 }
 
 main().catch((error) => {

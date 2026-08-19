@@ -80,6 +80,24 @@ CREATE TABLE IF NOT EXISTS usage_events (
   output_tokens INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS request_traces (
+  request_id TEXT PRIMARY KEY,
+  chat_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  input_kind TEXT NOT NULL CHECK (input_kind IN ('text', 'image')),
+  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'cancelled', 'timeout', 'failed')),
+  stages_json TEXT NOT NULL DEFAULT '[]',
+  tools_json TEXT NOT NULL DEFAULT '[]',
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  elapsed_ms INTEGER,
+  error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_request_traces_chat_started
+  ON request_traces(chat_id, started_at DESC);
 `;
 
 export function openDatabase(databasePath: string, logger?: AppLogger): Database.Database {

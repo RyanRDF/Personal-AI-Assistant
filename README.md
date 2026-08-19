@@ -5,6 +5,9 @@ Asisten AI personal berbasis Telegram untuk satu pemilik. Aplikasi dapat mengobr
 ## Fitur
 
 - Telegram long polling: tidak membutuhkan domain publik atau webhook.
+- Analisis gambar Telegram (foto maupun dokumen JPEG/PNG/WebP/GIF) dengan input vision OpenAI.
+- Foto tanpa caption disimpan hanya di memori selama 10 menit untuk pertanyaan teks berikutnya.
+- Streaming preview, indikator proses berkala, timeout, pembatalan, dan trace operasional.
 - Owner-only dan private-chat-only melalui `TELEGRAM_ALLOWED_USER_ID`.
 - Model dapat diganti lewat `.env`; default ekonomis `gpt-4o-mini`.
 - Memori personal dan riwayat percakapan persisten di SQLite.
@@ -56,6 +59,10 @@ TELEGRAM_ALLOWED_USER_ID=123456789
 OPENAI_API_KEY=sk-...
 OPENAI_CHAT_MODEL=gpt-4o-mini
 OPENAI_CLASSIFIER_MODEL=gpt-4o-mini
+OPENAI_MAX_OUTPUT_TOKENS=2000
+ASSISTANT_TIMEOUT_SECONDS=90
+TELEGRAM_IMAGE_MAX_BYTES=10485760
+TRACE_ENABLED_DEFAULT=false
 ```
 
 Jalankan:
@@ -175,6 +182,17 @@ Perintah:
 
 Memori memakai pencarian lexical lokal agar tidak membutuhkan embedding API dan tidak menambah biaya. Preferensi selalu tersedia sebagai konteks, sedangkan fakta lain hanya dimuat bila relevan dengan pertanyaan. Riwayat chat yang lebih lama dari `MESSAGE_RETENTION_DAYS` (default 90 hari) dibersihkan saat startup. Desain provider memungkinkan semantic/embedding retrieval ditambahkan nanti.
 
+## Analisis gambar dan trace
+
+Ada dua cara mengirim gambar:
+
+1. Kirim foto dengan caption pertanyaan; bot langsung menganalisisnya.
+2. Kirim foto tanpa caption; setelah bot mengonfirmasi penerimaan, kirim pertanyaan teks dalam 10 menit.
+
+Bot mengambil resolusi foto Telegram terbesar dan mengirim gambar sebagai data URL ke model vision. URL unduhan Telegram yang mengandung bot token tidak ditulis ke log. Gambar mentah tidak disimpan ke SQLite; riwayat hanya menyimpan caption dan penanda bahwa sebuah gambar pernah dilampirkan.
+
+Gunakan `/trace on` untuk menampilkan tahapan, tool, durasi, model, dan penggunaan token. `/last_trace` selalu dapat menampilkan trace teknis terakhir. Trace adalah observabilitas operasional, bukan chain-of-thought internal model. Gunakan `/cancel` untuk membatalkan request aktif. Bot memakai runner concurrent agar perintah pembatalan tetap dapat diproses ketika model sedang bekerja, sementara request AI tetap dibatasi satu per chat.
+
 ## Menjalankan dengan Docker
 
 ```powershell
@@ -202,6 +220,9 @@ npm audit
 |---|---|
 | `/start`, `/help` | Bantuan dan contoh penggunaan |
 | `/status` | Status model, Gmail, dan search |
+| `/trace on\|off` | Aktifkan/nonaktifkan detail proses live |
+| `/last_trace` | Lihat trace teknis permintaan terakhir |
+| `/cancel` | Batalkan permintaan aktif atau buang gambar sementara |
 | `/memory` | Daftar memori personal |
 | `/forget <id>` | Hapus memori |
 | `/clear_memory CONFIRM` | Hapus seluruh memori setelah konfirmasi eksplisit |
@@ -221,6 +242,8 @@ Selain perintah tersebut, gunakan bahasa natural untuk bertanya, menerjemahkan, 
 - Tool yang mengubah memori atau aturan hanya tersedia bila klausa awal pesan pemilik secara eksplisit meminta aksi tersebut; penghapusan hanya melalui command deterministik.
 - Subject/body email tidak ditulis ke log aplikasi.
 - Riwayat dan memori tersimpan lokal di SQLite dalam bentuk plaintext; lindungi akses ke folder `data` dan disk host.
+- Gambar dikirim ke OpenAI untuk dianalisis, tetapi gambar mentah tidak disimpan ke database atau log aplikasi.
+- Foto tanpa caption berada sementara di RAM dan kedaluwarsa otomatis; restart proses juga langsung membuangnya.
 - Tool yang tersedia tidak dapat mengirim email, menghapus email, menjalankan shell, atau melakukan transaksi.
 - SQLite cocok untuk satu proses personal. Jangan menjalankan beberapa replica bot terhadap volume database yang sama.
 - Pencocokan email memakai model probabilistik. Sesuaikan `GMAIL_MATCH_THRESHOLD` jika notifikasi terlalu banyak atau terlalu sedikit.

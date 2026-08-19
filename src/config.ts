@@ -12,7 +12,20 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().trim().min(1),
   OPENAI_CHAT_MODEL: z.string().trim().min(1).default("gpt-4o-mini"),
   OPENAI_CLASSIFIER_MODEL: z.string().trim().min(1).default("gpt-4o-mini"),
-  OPENAI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(128).max(16_384).default(1200),
+  OPENAI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(128).max(16_384).default(2000),
+  ASSISTANT_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(600).default(90),
+  TELEGRAM_IMAGE_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .min(1024)
+    .max(20 * 1024 * 1024)
+    .default(10 * 1024 * 1024),
+  TELEGRAM_PENDING_IMAGE_SECONDS: z.coerce.number().int().min(30).max(3600).default(600),
+  TELEGRAM_PROGRESS_UPDATE_MS: z.coerce.number().int().min(750).max(10_000).default(1200),
+  TRACE_ENABLED_DEFAULT: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   DATABASE_PATH: z.string().trim().min(1).default("./data/assistant.sqlite"),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])

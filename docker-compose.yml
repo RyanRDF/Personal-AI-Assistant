@@ -1,0 +1,25 @@
+services:
+  assistant:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Containers reach the optional search service by its Compose DNS name.
+      SEARXNG_BASE_URL: ${DOCKER_SEARXNG_BASE_URL:-http://searxng:8080}
+    volumes:
+      - ./data:/app/data
+
+  # Optional free search backend. Enable with:
+  # docker compose --profile searxng up -d
+  searxng:
+    image: searxng/searxng:latest
+    profiles: ["searxng"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-local-only-change-this-secret}
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro

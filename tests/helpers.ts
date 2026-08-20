@@ -17,12 +17,14 @@ export function testConfig(overrides: NodeJS.ProcessEnv = {}): AppConfig {
 
 export function temporaryDatabase(): {
   database: Database.Database;
+  directory: string;
   cleanup: () => void;
 } {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "personal-assistant-test-"));
   const database = openDatabase(path.join(directory, "test.sqlite"));
   return {
     database,
+    directory,
     cleanup: () => {
       database.close();
       fs.rmSync(directory, { recursive: true, force: true });

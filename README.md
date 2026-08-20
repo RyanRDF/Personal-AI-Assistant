@@ -11,6 +11,8 @@ Asisten AI personal berbasis Telegram untuk satu pemilik. Aplikasi dapat mengobr
 - Owner-only dan private-chat-only melalui `TELEGRAM_ALLOWED_USER_ID`.
 - Model dapat diganti lewat `.env`; default ekonomis `gpt-4o-mini`.
 - Memori personal dan riwayat percakapan persisten di SQLite.
+- Vault seperti file manager: forward chat/file, folder bertingkat, pencarian, rename, move, delete, pemeriksaan nama duplikat, dan pengiriman file kembali.
+- Dashboard responsif untuk melihat isi vault, upload/download, status bot, uptime, storage, serta kegagalan request.
 - Gmail read-only dengan OAuth 2.0.
 - Aturan email natural-language, klasifikasi semantik, Gmail History cursor, persistent outbox, dan deduplikasi notifikasi.
 - Brave Search API atau SearXNG sebagai pencarian web.
@@ -26,11 +28,14 @@ Telegram (owner only)
 PersonalAssistant ── OpenAI tool calling
         │
         ├── SQLite memory + conversation
+        ├── SQLite vault metadata + data/vault files
         ├── Gmail search
         ├── Email watch rules
         └── Brave Search / SearXNG
 
 Gmail History poller ── semantic classifier ── Telegram notification
+
+Dashboard HTTP ── authenticated vault API + /health
 ```
 
 Detail desain ada di [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Perbandingan model ada di [docs/MODEL_COMPARISON.md](docs/MODEL_COMPARISON.md).
@@ -44,7 +49,7 @@ Detail desain ada di [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Perbandingan 
 - OpenAI API key.
 - Opsional: Google OAuth client untuk Gmail.
 - Opsional: Brave Search API key atau Docker untuk SearXNG.
-- Untuk deployment yang direkomendasikan: Docker Engine/Desktop dengan Docker Compose v2.
+- Untuk deployment lokal/VPS: Docker Engine/Desktop dengan Docker Compose v2.
 
 ## Instalasi lokal
 
@@ -180,6 +185,13 @@ Salin `.env.example` menjadi `.env`, lalu ubah hanya nilai yang diperlukan. Nila
 | `TELEGRAM_PROGRESS_UPDATE_MS` | Tidak | Interval minimum edit progress; default `1200` ms |
 | `TRACE_ENABLED_DEFAULT` | Tidak | `true`/`false`; dapat diubah per chat melalui `/trace` |
 | `DATABASE_PATH` | Tidak | SQLite lokal; default `./data/assistant.sqlite` |
+| `VAULT_STORAGE_PATH` | Tidak | Direktori byte file vault; default `./data/vault` |
+| `VAULT_MAX_FILE_BYTES` | Tidak | Batas satu file; default/maksimum `20971520` (20 MiB) |
+| `MAX_VAULT_CONTEXT_ITEMS` | Tidak | Maksimum item vault relevan dalam konteks AI; default `12` |
+| `DASHBOARD_ENABLED` | Tidak | Jalankan dashboard dan `/health`; default `true` |
+| `DASHBOARD_HOST` | Tidak | Default `127.0.0.1`; cloud/container memakai `0.0.0.0` dengan token |
+| `PORT` | Tidak | Port dashboard; default `3030`, Railway menginjeksi nilainya |
+| `DASHBOARD_TOKEN` | Wajib untuk akses jaringan | Password Basic Auth dashboard; tidak diperlukan untuk loopback lokal |
 | `LOG_LEVEL` | Tidak | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, atau `silent` |
 | `TIMEZONE` | Tidak | IANA timezone; default `Asia/Jakarta` |
 | `MAX_HISTORY_MESSAGES` | Tidak | Jumlah pesan recent context; default `16` |
@@ -354,6 +366,27 @@ Perintah:
 
 Memori memakai pencarian lexical lokal agar tidak membutuhkan embedding API dan tidak menambah biaya. Preferensi selalu tersedia sebagai konteks, sedangkan fakta lain hanya dimuat bila relevan dengan pertanyaan. Riwayat chat yang lebih lama dari `MESSAGE_RETENTION_DAYS` (default 90 hari) dibersihkan saat startup. Desain provider memungkinkan semantic/embedding retrieval ditambahkan nanti.
 
+## Vault dan dashboard
+
+Forward chat atau dokumen non-gambar ke bot untuk menyimpannya langsung. Foto dan dokumen gambar hanya masuk vault bila merupakan forward atau memakai caption `/save [folder]`; selain itu alur analisis gambar tetap berlaku. Untuk menyimpan chat yang sudah ada, reply pesan tersebut dengan `/save [judul] | [folder opsional]`.
+
+Contoh alur:
+
+```text
+/mkdir Kerja/Invoice
+
+# kirim dokumen dengan caption:
+/save Kerja/Invoice
+
+# cari dan ambil kembali:
+/find invoice Agustus
+/get 42
+```
+
+Nama item harus unik di folder yang sama tanpa membedakan huruf besar/kecil. Bila nama sudah ada, bot/dashboard menolak upload dan menunjukkan item konflik; file lama tidak ditimpa diam-diam.
+
+Jalankan aplikasi, lalu buka `http://127.0.0.1:3030`. Dashboard menyediakan navigasi folder, pencarian nama/isi catatan, upload/download, catatan baru, rename, move, delete dengan konfirmasi, dan ringkasan status aplikasi. Untuk Docker/cloud, isi `DASHBOARD_TOKEN`; browser meminta Basic Auth (username bebas, password adalah token tersebut).
+
 ## Analisis gambar dan trace
 
 Ada dua cara mengirim gambar:
@@ -396,11 +429,18 @@ Lanjutkan dengan uji fungsional lokal:
 
 ## Deployment
 
-### Pilihan A — Docker Compose (direkomendasikan)
+### Pilihan A — Railway + persistent volume (direkomendasikan untuk 24/7)
+
+Repository sudah menyertakan `railway.json`, healthcheck `/health`, restart policy, dan Dockerfile. Buat satu service dari GitHub, pasang volume pada `/app/data`, gunakan tepat satu replica, lalu set `DATABASE_PATH=/app/data/assistant.sqlite`, `VAULT_STORAGE_PATH=/app/data/vault`, `DASHBOARD_HOST=0.0.0.0`, `DASHBOARD_TOKEN`, dan `RAILWAY_RUN_UID=0`. Railway akan menginjeksi `PORT`.
+
+Panduan lengkap, topologi, daftar variable, backup/restore, dan alternatif Fly.io ada di [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+### Pilihan B — Docker Compose di VPS
 
 Sebelum menyalin project ke server:
 
 - Lengkapi `.env` dan uji bot secara lokal.
+- Isi `DASHBOARD_TOKEN`; Compose mengekspos dashboard hanya pada `127.0.0.1:${PORT:-3030}` di host.
 - Jika Gmail digunakan, hasilkan `GMAIL_REFRESH_TOKEN` secara lokal terlebih dahulu.
 - Pastikan server dapat membuat koneksi HTTPS keluar ke Telegram, OpenAI, dan Google. Telegram long polling tidak memerlukan port masuk atau domain publik.
 - Di Linux, batasi izin file dengan `chmod 600 .env`.
@@ -440,7 +480,7 @@ docker compose down
 
 `docker compose down` menghapus container dan network, tetapi bind mount `./data` tetap berada di host. Jangan gunakan `down -v` dan jangan menghapus folder `data` bila database masih diperlukan. Dokumentasi Docker menyarankan file Compose tambahan untuk perbedaan production bila nanti Anda membutuhkan konfigurasi khusus server; lihat [Docker Compose production](https://docs.docker.com/compose/how-tos/production/).
 
-### Pilihan B — Node.js sebagai proses langsung
+### Pilihan C — Node.js sebagai proses langsung
 
 Gunakan pilihan ini bila server tidak memakai Docker:
 
@@ -487,7 +527,7 @@ sudo journalctl -u personal-ai-assistant -f
 
 ### Data persisten dan backup
 
-SQLite, memori, aturan email, cursor Gmail, dan trace tersimpan pada `./data`. Untuk backup yang konsisten:
+SQLite, memori, aturan email, cursor Gmail, trace, dan seluruh byte file vault tersimpan pada `./data`. Untuk backup yang konsisten:
 
 1. Hentikan proses/container assistant.
 2. Salin seluruh folder `data` ke lokasi backup yang terenkripsi atau aksesnya terbatas.
@@ -501,10 +541,12 @@ File `.env` juga perlu dicadangkan secara aman, terpisah dari Git. Jangan menaru
 - Token/key yang pernah tampil di chat, screenshot, atau commit sudah dirotasi.
 - Hanya satu proses bot berjalan untuk token tersebut.
 - Folder `data` persisten dan mempunyai backup.
+- Database dan folder `data/vault` selalu dibackup/dipulihkan sebagai satu kesatuan.
 - `/status` tidak menunjukkan konfigurasi wajib yang hilang atau dead-letter Gmail.
 - Chat teks, gambar, dan `/last_trace` berhasil.
 - Gmail search/watch berhasil bila diaktifkan.
 - Web search menghasilkan URL sumber bila diaktifkan.
+- Dashboard memakai HTTPS + `DASHBOARD_TOKEN` bila diakses melalui jaringan.
 - SearXNG tetap terikat ke localhost dan tidak terbuka ke internet.
 
 ## Troubleshooting runtime
@@ -530,6 +572,14 @@ File `.env` juga perlu dicadangkan secara aman, terpisah dari Git. Jangan menaru
 | `/memory` | Daftar memori personal |
 | `/forget <id>` | Hapus memori |
 | `/clear_memory CONFIRM` | Hapus seluruh memori setelah konfirmasi eksplisit |
+| `/vault [folder]` | Lihat isi root atau folder vault |
+| `/mkdir <folder/subfolder>` | Buat folder bertingkat |
+| `/save` | Simpan pesan yang dibalas; pada file dapat dipakai sebagai caption |
+| `/find <query>` | Cari nama file atau isi catatan |
+| `/get <id>` | Kirim kembali file ke Telegram |
+| `/rename <id> <nama>` | Ubah nama item setelah cek duplikat |
+| `/move <id> <folder\|/>` | Pindahkan item ke folder atau root |
+| `/delete_item <id> CONFIRM` | Hapus item/folder beserta isinya |
 | `/watches` | Daftar aturan email |
 | `/pause_watch <id>` | Jeda aturan |
 | `/resume_watch <id>` | Aktifkan aturan |
@@ -542,10 +592,11 @@ Selain perintah tersebut, gunakan bahasa natural untuk bertanya, menerjemahkan, 
 
 - Bot menolak semua user selain ID pemilik dan menolak group chat.
 - Gmail memakai read-only scope.
-- Email, hasil web, dan teks di dalam gambar diperlakukan sebagai untrusted data dalam prompt.
+- Email, hasil web, isi vault, dan teks di dalam gambar diperlakukan sebagai untrusted data dalam prompt.
 - Tool yang mengubah memori atau aturan hanya tersedia bila klausa awal pesan pemilik secara eksplisit meminta aksi tersebut; penghapusan hanya melalui command deterministik.
 - Subject/body email tidak ditulis ke log aplikasi.
-- Riwayat dan memori tersimpan lokal di SQLite dalam bentuk plaintext; lindungi akses ke folder `data` dan disk host.
+- Riwayat, memori, dan seluruh isi vault tersimpan dalam bentuk plaintext; lindungi folder/volume `data`, backup, serta dashboard.
+- Dashboard tanpa token hanya diizinkan pada loopback. Bind jaringan/cloud gagal saat startup bila `DASHBOARD_TOKEN` kosong.
 - Gambar dikirim ke OpenAI untuk dianalisis, tetapi gambar mentah tidak disimpan ke database atau log aplikasi.
 - Foto tanpa caption berada sementara di RAM dan kedaluwarsa otomatis; restart proses juga langsung membuangnya.
 - Tool yang tersedia tidak dapat mengirim email, menghapus email, menjalankan shell, atau melakukan transaksi.

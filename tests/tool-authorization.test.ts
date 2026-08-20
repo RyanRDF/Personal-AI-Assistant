@@ -11,6 +11,15 @@ describe("assistant tool authorization", () => {
     expect(allowed.has("create_email_watch")).toBe(false);
     expect(allowed.has("search_gmail")).toBe(true);
     expect(allowed.has("search_web")).toBe(true);
+    expect(allowed.has("save_vault_note")).toBe(false);
+  });
+
+  it("allows vault mutation only when the owner names the vault intent", () => {
+    const allowed = authorizedToolNames("Tolong simpan catatan ini ke vault kerja.");
+    expect(allowed.has("save_vault_note")).toBe(true);
+    expect(allowed.has("remember")).toBe(false);
+    expect(allowed.has("search_vault")).toBe(true);
+    expect(allowed.has("return_vault_file")).toBe(true);
   });
 
   it("allows memory mutation only for an explicit owner request", () => {

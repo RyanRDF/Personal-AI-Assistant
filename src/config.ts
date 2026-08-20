@@ -27,6 +27,16 @@ const envSchema = z.object({
     .default("false")
     .transform((value) => value === "true"),
   DATABASE_PATH: z.string().trim().min(1).default("./data/assistant.sqlite"),
+  VAULT_STORAGE_PATH: z.string().trim().min(1).default("./data/vault"),
+  VAULT_MAX_FILE_BYTES: z.coerce.number().int().min(1024).max(20 * 1024 * 1024).default(20 * 1024 * 1024),
+  MAX_VAULT_CONTEXT_ITEMS: z.coerce.number().int().min(1).max(50).default(12),
+  DASHBOARD_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  DASHBOARD_HOST: z.string().trim().min(1).default("127.0.0.1"),
+  PORT: z.coerce.number().int().min(1).max(65_535).default(3030),
+  DASHBOARD_TOKEN: optionalTrimmedString,
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),

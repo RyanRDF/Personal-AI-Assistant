@@ -18,6 +18,31 @@ export interface MemoryItem {
   updatedAt: string;
 }
 
+export type VaultItemKind = "folder" | "file" | "note";
+
+export interface VaultItem {
+  id: number;
+  parentId: number | null;
+  kind: VaultItemKind;
+  name: string;
+  mimeType: string | null;
+  sizeBytes: number;
+  storageKey: string | null;
+  content: string | null;
+  sha256: string | null;
+  sourceChatId: string | null;
+  sourceMessageId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VaultStats {
+  folders: number;
+  files: number;
+  notes: number;
+  totalBytes: number;
+}
+
 export interface EmailRule {
   id: number;
   description: string;

@@ -5,6 +5,7 @@ import { createLogger } from "../src/logger.js";
 import { ConversationService } from "../src/services/conversation.js";
 import { EmailRuleService } from "../src/services/email-rules.js";
 import { MemoryService } from "../src/services/memory.js";
+import { VaultService } from "../src/services/vault.js";
 import { temporaryDatabase, testConfig } from "./helpers.js";
 
 function fakeStream(chunks: unknown[]): AsyncIterable<unknown> {
@@ -17,7 +18,7 @@ function fakeStream(chunks: unknown[]): AsyncIterable<unknown> {
 
 describe("assistant vision input", () => {
   it("sends image data to OpenAI but stores only a non-sensitive marker", async () => {
-    const { database, cleanup } = temporaryDatabase();
+    const { database, directory, cleanup } = temporaryDatabase();
     try {
       const create = vi.fn().mockResolvedValue(
         fakeStream([
@@ -39,6 +40,7 @@ describe("assistant vision input", () => {
         {
           conversations,
           memories: new MemoryService(database),
+          vault: new VaultService(database, `${directory}/vault`),
           emailRules: new EmailRuleService(database),
           gmail: null,
           search: {

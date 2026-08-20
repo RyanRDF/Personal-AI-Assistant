@@ -25,6 +25,33 @@ CREATE TABLE IF NOT EXISTS memories (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS vault_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER REFERENCES vault_items(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('folder', 'file', 'note')),
+  name TEXT NOT NULL,
+  mime_type TEXT,
+  size_bytes INTEGER NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
+  storage_key TEXT,
+  content TEXT,
+  sha256 TEXT,
+  source_chat_id TEXT,
+  source_message_id TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (
+    (kind = 'folder' AND storage_key IS NULL AND content IS NULL) OR
+    (kind = 'file' AND storage_key IS NOT NULL AND content IS NULL) OR
+    (kind = 'note' AND storage_key IS NULL AND content IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_sibling_name
+  ON vault_items(COALESCE(parent_id, 0), lower(name));
+CREATE INDEX IF NOT EXISTS idx_vault_parent_kind
+  ON vault_items(parent_id, kind, name);
+CREATE INDEX IF NOT EXISTS idx_vault_sha256
+  ON vault_items(sha256) WHERE sha256 IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS email_rules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   description TEXT NOT NULL,

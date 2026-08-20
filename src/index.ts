@@ -5,12 +5,14 @@ import { PersonalAssistant } from "./ai/assistant.js";
 import { isGmailConfigured, loadConfig } from "./config.js";
 import { openDatabase } from "./db.js";
 import { createLogger } from "./logger.js";
+import { startDashboard, stopDashboard } from "./dashboard/server.js";
 import { ConversationService } from "./services/conversation.js";
 import { EmailRuleService } from "./services/email-rules.js";
 import { EmailWatcher } from "./services/email-watcher.js";
 import { GmailService } from "./services/gmail.js";
 import { MemoryService } from "./services/memory.js";
 import { RequestTraceService } from "./services/request-trace.js";
+import { VaultService } from "./services/vault.js";
 import { createSearchProvider } from "./services/web-search.js";
 import { createTelegramBot, splitTelegramMessage } from "./telegram/bot.js";
 
@@ -24,6 +26,7 @@ async function main(): Promise<void> {
     logger.info({ prunedMessages }, "Expired conversation messages deleted");
   }
   const memories = new MemoryService(database);
+  const vault = new VaultService(database, config.VAULT_STORAGE_PATH);
   const traces = new RequestTraceService(database, config.TRACE_ENABLED_DEFAULT);
   traces.pruneOlderThan(config.MESSAGE_RETENTION_DAYS);
   const emailRules = new EmailRuleService(database);
@@ -34,6 +37,7 @@ async function main(): Promise<void> {
   const assistant = new PersonalAssistant(config, database, logger, {
     conversations,
     memories,
+    vault,
     emailRules,
     gmail,
     search,
@@ -42,16 +46,24 @@ async function main(): Promise<void> {
     assistant,
     conversations,
     memories,
+    vault,
     emailRules,
     search,
     traces,
     gmailConfigured,
   });
-
   await bot.init();
   await bot.api.setMyCommands([
     { command: "start", description: "Mulai dan lihat bantuan" },
     { command: "memory", description: "Lihat memori personal" },
+    { command: "vault", description: "Lihat isi vault/rak file" },
+    { command: "mkdir", description: "Buat folder vault" },
+    { command: "save", description: "Simpan chat atau file yang dibalas" },
+    { command: "find", description: "Cari isi vault" },
+    { command: "get", description: "Kirim kembali file vault" },
+    { command: "rename", description: "Ubah nama item vault" },
+    { command: "move", description: "Pindahkan item vault" },
+    { command: "delete_item", description: "Hapus item vault" },
     { command: "clear_memory", description: "Hapus semua memori (perlu konfirmasi)" },
     { command: "watches", description: "Lihat aturan email" },
     { command: "status", description: "Cek status layanan" },
@@ -61,6 +73,7 @@ async function main(): Promise<void> {
     { command: "clear_chat", description: "Hapus riwayat percakapan pendek" },
     { command: "help", description: "Lihat bantuan" },
   ]);
+  const dashboard = await startDashboard(config, { database, vault, logger });
 
   let watcher: EmailWatcher | null = null;
   if (gmail) {
@@ -93,6 +106,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, "Shutting down");
     await watcher?.stopAndWait();
     await runner.stop();
+    await stopDashboard(dashboard);
     database.close();
   };
   process.once("SIGINT", () => void shutdown("SIGINT"));

@@ -12,7 +12,7 @@
 
 ### Telegram adapter
 
-`src/telegram/bot.ts` menerima update teks, foto, dan dokumen gambar melalui long polling concurrent. Middleware pertama memverifikasi numeric owner ID dan private chat. Foto dengan caption langsung diteruskan sebagai input vision; foto tanpa caption hanya disimpan sementara di RAM untuk pertanyaan berikutnya. Progress edit dibatasi lajunya, request memiliki timeout, dan `/cancel` tetap responsif ketika model bekerja.
+`src/telegram/bot.ts` menerima update teks, foto, dan dokumen melalui long polling concurrent. Middleware pertama memverifikasi numeric owner ID dan private chat. Forward chat/file disimpan ke vault; gambar biasa tetap mengikuti alur vision. Progress edit dibatasi lajunya, request memiliki timeout, dan `/cancel` tetap responsif ketika model bekerja.
 
 ### AI orchestrator
 
@@ -24,12 +24,27 @@
 - `list_email_watches`
 - `search_gmail`
 - `search_web`
+- `save_vault_note`
+- `create_vault_folder`
+- `search_vault`
+- `list_vault`
+- `return_vault_file`
 
 Model melakukan maksimum enam putaran tool untuk mencegah loop tanpa batas. Chat completion diproses secara streaming agar preview jawaban dapat ditampilkan. Tool mutasi hanya dimasukkan ke request model bila klausa awal pesan pemilik memberi intent eksplisit; penghapusan memori/aturan tetap command Telegram deterministik. Semua penggunaan token ditulis ke `usage_events`; tahap, tool, durasi, dan status request ditulis ke `request_traces` tanpa menyimpan gambar atau chain-of-thought.
 
 ### Memori
 
 SQLite menyimpan riwayat pendek dan memori jangka panjang secara terpisah. Retrieval memori memakai lexical overlap lokal. Ini cukup untuk satu pengguna dan menghindari biaya embedding. Implementasi dapat diganti dengan hybrid retrieval dari Standalone RAG Chatbot tanpa mengubah Telegram.
+
+### Vault
+
+`VaultService` memakai SQLite untuk struktur folder, nama, tipe, hash, sumber Telegram, dan isi catatan. Byte file memakai nama storage key acak di `VAULT_STORAGE_PATH`, sehingga nama pengguna tidak pernah menjadi path filesystem. Unique index pada `(parent, lower(name))` menolak nama duplikat di folder yang sama. Move mencegah siklus folder; delete rekursif membersihkan metadata dan byte file.
+
+Catatan dan nama file yang relevan dimasukkan sebagai data tidak tepercaya ke konteks assistant. Tool read-only dapat mencari item dan mengantrekan file untuk dikirim kembali ke chat Telegram pemilik.
+
+### Dashboard
+
+Server HTTP bawaan menyediakan dashboard file manager, API vault, dan `/health`. Dashboard hanya dapat berjalan tanpa token pada interface loopback. Bind ke container/jaringan mewajibkan Basic Auth melalui `DASHBOARD_TOKEN`. Endpoint health tidak menampilkan isi file atau secret.
 
 ### Gmail
 
@@ -66,6 +81,7 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 |---|---|
 | `messages` | Riwayat percakapan pendek per Telegram chat |
 | `memories` | Preferensi/fakta/komitmen personal |
+| `vault_items` | Struktur folder, catatan, dan metadata file vault |
 | `email_rules` | Deskripsi semantik dan Gmail query opsional |
 | `email_evaluations` | Deduplikasi dan audit hasil rule-message |
 | `email_processing_failures` | Retry/dead-letter fetch dan klasifikasi |
@@ -78,12 +94,12 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 
 - Telegram identity adalah authorization boundary utama.
 - `.env` adalah secret boundary dan tidak masuk Git.
-- Email, web, dan teks di dalam gambar merupakan input tidak tepercaya.
+- Email, web, data vault, dan teks di dalam gambar merupakan input tidak tepercaya.
 - Gambar dikirim ke model sebagai data URL dan tidak disimpan di database atau log.
 - Subject, snippet, dan body email yang dipotong dikirim ke OpenAI untuk klasifikasi/pencarian; tidak ditulis ke log.
-- OpenAI tidak diberi tool shell, file mutation, email send, atau delete.
+- OpenAI tidak diberi tool shell, email send, atau delete; mutasi vault hanya tersedia untuk intent eksplisit.
 - Gmail token hanya dibaca dari environment; tidak disimpan plaintext di database.
-- Memori dan riwayat chat tetap plaintext di SQLite; keamanan disk/volume host berada di luar proses aplikasi.
+- Memori, riwayat chat, catatan vault, dan file tetap plaintext; keamanan disk/volume host berada di luar proses aplikasi.
 
 ## Pengembangan berikutnya
 

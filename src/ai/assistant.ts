@@ -8,6 +8,7 @@ import type { ConversationService } from "../services/conversation.js";
 import type { EmailRuleService } from "../services/email-rules.js";
 import type { GmailService } from "../services/gmail.js";
 import type { MemoryService } from "../services/memory.js";
+import type { VaultService } from "../services/vault.js";
 import { formatSearchResults, type WebSearchProvider } from "../services/web-search.js";
 import { buildSystemPrompt } from "./prompts.js";
 
@@ -27,6 +28,93 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           content: { type: "string", minLength: 2, maxLength: 500 },
         },
         required: ["kind", "content"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "save_vault_note",
+      description:
+        "Simpan chat, pengingat, atau catatan penting ke vault. Gunakan hanya saat pengguna eksplisit meminta menyimpan ke vault/rak/arsip.",
+      strict: true,
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", minLength: 1, maxLength: 180 },
+          content: { type: "string", minLength: 1, maxLength: 10_000 },
+          folder: {
+            type: ["string", "null"],
+            description: "Path folder seperti Kerja/Invoice, atau null untuk root.",
+          },
+        },
+        required: ["name", "content", "folder"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_vault_folder",
+      description: "Buat satu atau beberapa folder bertingkat di vault.",
+      strict: true,
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", minLength: 1, maxLength: 500 },
+        },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_vault",
+      description:
+        "Cari catatan atau file yang pernah disimpan di vault berdasarkan nama maupun isi catatan.",
+      strict: true,
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", minLength: 1, maxLength: 400 },
+          limit: { type: "integer", minimum: 1, maximum: 10 },
+        },
+        required: ["query", "limit"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_vault",
+      description: "Lihat isi folder vault. Gunakan null untuk folder root.",
+      strict: true,
+      parameters: {
+        type: "object",
+        properties: {
+          folder: { type: ["string", "null"] },
+        },
+        required: ["folder"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "return_vault_file",
+      description:
+        "Kirim kembali file vault ke chat Telegram pemilik. Panggil setelah menemukan ID file yang tepat.",
+      strict: true,
+      parameters: {
+        type: "object",
+        properties: { id: { type: "integer", minimum: 1 } },
+        required: ["id"],
         additionalProperties: false,
       },
     },
@@ -127,6 +215,18 @@ const gmailSearchArgsSchema = z.object({
   limit: z.number().int().min(1).max(10),
 });
 const webSearchArgsSchema = z.object({ query: z.string().min(1).max(400) });
+const saveVaultNoteArgsSchema = z.object({
+  name: z.string().min(1).max(180),
+  content: z.string().min(1).max(10_000),
+  folder: z.string().max(500).nullable(),
+});
+const createVaultFolderArgsSchema = z.object({ path: z.string().min(1).max(500) });
+const searchVaultArgsSchema = z.object({
+  query: z.string().min(1).max(400),
+  limit: z.number().int().min(1).max(10),
+});
+const listVaultArgsSchema = z.object({ folder: z.string().max(500).nullable() });
+const returnVaultFileArgsSchema = z.object({ id: z.number().int().positive() });
 
 export interface AssistantImageInput {
   dataUrl: string;
@@ -143,7 +243,8 @@ export type AssistantEvent =
   | { type: "stage"; name: string; label: string }
   | { type: "tool"; name: string; label: string }
   | { type: "partial"; text: string }
-  | { type: "usage"; inputTokens: number; outputTokens: number };
+  | { type: "usage"; inputTokens: number; outputTokens: number }
+  | { type: "file"; itemId: number };
 
 export interface AssistantReplyOptions {
   signal?: AbortSignal;
@@ -170,12 +271,24 @@ function toolLabel(name: string): string {
     list_email_watches: "Membaca aturan email",
     search_gmail: "Mencari Gmail",
     search_web: "Mencari web",
+    save_vault_note: "Menyimpan catatan ke vault",
+    create_vault_folder: "Membuat folder vault",
+    search_vault: "Mencari isi vault",
+    list_vault: "Membaca folder vault",
+    return_vault_file: "Menyiapkan file vault",
   };
   return labels[name] ?? `Menjalankan ${name}`;
 }
 
 export function authorizedToolNames(userText: string): Set<string> {
-  const allowed = new Set(["list_email_watches", "search_gmail", "search_web"]);
+  const allowed = new Set([
+    "list_email_watches",
+    "search_gmail",
+    "search_web",
+    "search_vault",
+    "list_vault",
+    "return_vault_file",
+  ]);
   // Only the owner's leading request clause can authorize a local mutation. Text after a
   // colon/newline is commonly pasted email or web content and must not grant capabilities.
   const intentText = userText.trim().split(/[:\n]/u, 1)[0]?.slice(0, 400) ?? "";
@@ -197,17 +310,26 @@ export function authorizedToolNames(userText: string): Set<string> {
     /^(?:kalau|jika|bila|setiap)\b.{0,180}\b(?:email|gmail)\b.{0,180}\b(?:kabari|beri tahu|beritahu|notifikasi|kirimkan?)\b/isu.test(
       intentText,
     );
-  if (memoryIntent) {
+  const vaultSaveIntent = /^(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:simpan(?:lah)?|arsipkan|catat(?:lah)?)\b.{0,180}\b(?:vault|rak|arsip)\b/isu.test(
+    intentText,
+  );
+  const vaultFolderIntent = /^(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:buat(?:kan)?|bikin(?:kan)?|tambah(?:kan)?)\b.{0,100}\b(?:folder|direktori|rak)\b/isu.test(
+    intentText,
+  );
+  if (memoryIntent && !vaultSaveIntent) {
     allowed.add("remember");
     allowed.add("update_memory");
   }
   if (emailWatchIntent) allowed.add("create_email_watch");
+  if (vaultSaveIntent) allowed.add("save_vault_note");
+  if (vaultFolderIntent) allowed.add("create_vault_folder");
   return allowed;
 }
 
 interface AssistantDependencies {
   conversations: ConversationService;
   memories: MemoryService;
+  vault: VaultService;
   emailRules: EmailRuleService;
   gmail: GmailService | null;
   search: WebSearchProvider;
@@ -246,12 +368,19 @@ export class PersonalAssistant {
       userText,
       this.config.MAX_MEMORY_ITEMS,
     );
+    const vaultContext = this.dependencies.vault.relevant(
+      userText,
+      this.config.MAX_VAULT_CONTEXT_ITEMS,
+    );
     const history = this.dependencies.conversations.recent(
       chatId,
       this.config.MAX_HISTORY_MESSAGES,
     );
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-      { role: "system", content: buildSystemPrompt(this.config.TIMEZONE, memories) },
+      {
+        role: "system",
+        content: buildSystemPrompt(this.config.TIMEZONE, memories, vaultContext),
+      },
       ...history.map((message): OpenAI.Chat.Completions.ChatCompletionMessageParam => {
         if (message.id === storedMessage.id && images.length > 0) {
           return {
@@ -317,6 +446,7 @@ export class PersonalAssistant {
           call.function.name,
           call.function.arguments,
           allowedToolNames,
+          options,
         );
         messages.push({ role: "tool", tool_call_id: call.id, content: result });
       }
@@ -406,6 +536,7 @@ export class PersonalAssistant {
     name: string,
     rawArguments: string,
     allowedToolNames: Set<string>,
+    options: AssistantReplyOptions,
   ): Promise<string> {
     try {
       if (!allowedToolNames.has(name)) {
@@ -457,6 +588,50 @@ export class PersonalAssistant {
           const { query } = webSearchArgsSchema.parse(parsed);
           const results = await this.dependencies.search.search(query);
           return formatSearchResults(results, this.dependencies.search.name);
+        }
+        case "save_vault_note": {
+          const args = saveVaultNoteArgsSchema.parse(parsed);
+          const parent = args.folder ? this.dependencies.vault.ensureFolderPath(args.folder) : null;
+          const item = this.dependencies.vault.saveNote(args.name, args.content, parent?.id ?? null);
+          return JSON.stringify({ saved: true, item, path: this.dependencies.vault.pathFor(item.id) });
+        }
+        case "create_vault_folder": {
+          const { path } = createVaultFolderArgsSchema.parse(parsed);
+          const folder = this.dependencies.vault.ensureFolderPath(path);
+          return JSON.stringify({ created: Boolean(folder), folder });
+        }
+        case "search_vault": {
+          const args = searchVaultArgsSchema.parse(parsed);
+          const items = this.dependencies.vault.search(args.query, args.limit).map((item) => ({
+            ...item,
+            storageKey: undefined,
+            sha256: undefined,
+            path: this.dependencies.vault.pathFor(item.id),
+          }));
+          return JSON.stringify({ items });
+        }
+        case "list_vault": {
+          const { folder } = listVaultArgsSchema.parse(parsed);
+          const parent = folder ? this.dependencies.vault.resolveFolderPath(folder) : null;
+          if (folder && !parent) return JSON.stringify({ error: `Folder ${folder} tidak ditemukan.` });
+          const items = this.dependencies.vault.list(parent?.id ?? null).map((item) => ({
+            id: item.id,
+            kind: item.kind,
+            name: item.name,
+            sizeBytes: item.sizeBytes,
+            updatedAt: item.updatedAt,
+          }));
+          return JSON.stringify({ folder: folder ?? "/", items });
+        }
+        case "return_vault_file": {
+          const { id } = returnVaultFileArgsSchema.parse(parsed);
+          const item = this.dependencies.vault.get(id);
+          if (!item || item.kind !== "file") {
+            return JSON.stringify({ error: `File vault ${id} tidak ditemukan.` });
+          }
+          // The Telegram adapter handles the actual send after the assistant response.
+          this.emit(options, { type: "file", itemId: id });
+          return JSON.stringify({ queued: true, id, name: item.name });
         }
         default:
           return JSON.stringify({ error: `Tool tidak dikenal: ${name}` });

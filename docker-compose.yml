@@ -8,6 +8,10 @@ services:
     environment:
       # Containers reach the optional search service by its Compose DNS name.
       SEARXNG_BASE_URL: ${DOCKER_SEARXNG_BASE_URL:-http://searxng:8080}
+      # Set DASHBOARD_TOKEN in .env before starting Compose.
+      DASHBOARD_HOST: ${DOCKER_DASHBOARD_HOST:-0.0.0.0}
+    ports:
+      - "127.0.0.1:${PORT:-3030}:${PORT:-3030}"
     volumes:
       - ./data:/app/data
 

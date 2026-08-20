@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { Bot, GrammyError, HttpError, type Context } from "grammy";
+import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type {
   AssistantEvent,
   AssistantImageInput,
@@ -10,6 +10,11 @@ import { safeErrorMessage, type AppLogger } from "../logger.js";
 import type { ConversationService } from "../services/conversation.js";
 import type { EmailRuleService } from "../services/email-rules.js";
 import type { MemoryService } from "../services/memory.js";
+import {
+  DuplicateVaultItemError,
+  InvalidVaultOperationError,
+  type VaultService,
+} from "../services/vault.js";
 import {
   formatRequestTrace,
   type RequestTrace,
@@ -26,9 +31,19 @@ Contoh:
 • Kalau ada email tentang invoice proyek Alpha, kabari saya.
 • Cari email dari Budi tentang rapat minggu lalu.
 • Cari berita terbaru tentang teknologi AI.
+• Forward file atau chat penting untuk langsung menyimpannya ke vault.
+• Minta "carikan lalu kirim file invoice dari vault" dengan bahasa biasa.
 
 Perintah:
 /memory — lihat memori tersimpan
+/vault [folder] — lihat isi vault
+/mkdir <folder/subfolder> — buat folder
+/save — simpan pesan yang dibalas; pada file gunakan caption /save [folder]
+/find <kata> — cari catatan dan file
+/get <id> — kirim kembali file
+/rename <id> <nama baru> — ubah nama item
+/move <id> <folder|/> — pindahkan item
+/delete_item <id> CONFIRM — hapus item/folder
 /forget <id> — hapus satu memori
 /clear_memory CONFIRM — hapus semua memori
 /watches — lihat aturan email
@@ -60,6 +75,7 @@ interface BotDependencies {
   assistant: PersonalAssistant;
   conversations: ConversationService;
   memories: MemoryService;
+  vault: VaultService;
   emailRules: EmailRuleService;
   search: WebSearchProvider;
   traces: RequestTraceService;
@@ -114,6 +130,66 @@ function commandId(text: string | undefined): number | null {
 
 function formatByteLimit(bytes: number): string {
   return `${Math.floor(bytes / (1024 * 1024))} MB`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function commandArguments(text: string | undefined): string {
+  return (text ?? "").replace(/^\/\w+(?:@\w+)?\s*/u, "").trim();
+}
+
+function generatedNoteName(text: string, messageId: number): string {
+  const firstLine = text.replace(/\s+/gu, " ").trim().slice(0, 72);
+  return firstLine || `Catatan Telegram ${messageId}`;
+}
+
+function generatedPhotoName(messageId: number): string {
+  return `Foto Telegram ${messageId}.jpg`;
+}
+
+async function downloadTelegramFile(
+  ctx: Context,
+  config: AppConfig,
+  fileId: string,
+  knownFileSize: number | undefined,
+  signal?: AbortSignal,
+  fetcher: typeof fetch = fetch,
+): Promise<Uint8Array> {
+  if (knownFileSize && knownFileSize > config.VAULT_MAX_FILE_BYTES) {
+    throw new InvalidVaultOperationError(
+      `Ukuran file melebihi batas vault ${formatByteLimit(config.VAULT_MAX_FILE_BYTES)}.`,
+    );
+  }
+  const file = await ctx.api.getFile(fileId);
+  if (!file.file_path) throw new InvalidVaultOperationError("Lokasi file Telegram tidak tersedia.");
+  if (file.file_size && file.file_size > config.VAULT_MAX_FILE_BYTES) {
+    throw new InvalidVaultOperationError(
+      `Ukuran file melebihi batas vault ${formatByteLimit(config.VAULT_MAX_FILE_BYTES)}.`,
+    );
+  }
+  // Do not log this URL because it contains the bot token.
+  const response = await fetcher(
+    `https://api.telegram.org/file/bot${config.TELEGRAM_BOT_TOKEN}/${file.file_path}`,
+    signal ? { signal } : undefined,
+  );
+  if (!response.ok) throw new InvalidVaultOperationError(`Gagal mengunduh file (${response.status}).`);
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (contentLength > config.VAULT_MAX_FILE_BYTES) {
+    throw new InvalidVaultOperationError(
+      `Ukuran file melebihi batas vault ${formatByteLimit(config.VAULT_MAX_FILE_BYTES)}.`,
+    );
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > config.VAULT_MAX_FILE_BYTES) {
+    throw new InvalidVaultOperationError(
+      `Ukuran file melebihi batas vault ${formatByteLimit(config.VAULT_MAX_FILE_BYTES)}.`,
+    );
+  }
+  return bytes;
 }
 
 function imageMimeFromPath(filePath: string): string | null {
@@ -343,6 +419,62 @@ export function createTelegramBot(
     return true;
   }
 
+  async function sendVaultFile(ctx: Context, itemId: number): Promise<void> {
+    const item = dependencies.vault.get(itemId);
+    if (!item || item.kind !== "file") {
+      await ctx.reply(`File vault ${itemId} tidak ditemukan.`);
+      return;
+    }
+    await ctx.replyWithDocument(new InputFile(dependencies.vault.filePath(item.id), item.name), {
+      caption: `📎 ${dependencies.vault.pathFor(item.id)} · ${formatBytes(item.sizeBytes)}`,
+    });
+  }
+
+  async function saveTelegramFile(
+    ctx: Context,
+    input: {
+      fileId: string;
+      fileName: string;
+      mimeType?: string;
+      fileSize?: number;
+      folderPath?: string;
+    },
+  ): Promise<void> {
+    const status = await ctx.reply("📥 Menyimpan file ke vault…");
+    try {
+      const parent = input.folderPath
+        ? dependencies.vault.ensureFolderPath(input.folderPath)
+        : null;
+      const bytes = await downloadTelegramFile(
+        ctx,
+        config,
+        input.fileId,
+        input.fileSize,
+      );
+      const item = dependencies.vault.saveFile({
+        name: input.fileName,
+        ...(input.mimeType ? { mimeType: input.mimeType } : {}),
+        bytes,
+        parentId: parent?.id ?? null,
+        chatId: String(ctx.chat!.id),
+        messageId: String(ctx.message?.message_id ?? ""),
+      });
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        status.message_id,
+        `✅ File disimpan: ${dependencies.vault.pathFor(item.id)} (#${item.id}, ${formatBytes(item.sizeBytes)})`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof DuplicateVaultItemError
+          ? `Nama duplikat: ${error.existing.name} sudah ada sebagai #${error.existing.id}. Ubah nama item lama lewat /rename atau simpan ke folder lain.`
+          : error instanceof Error
+            ? error.message
+            : "File gagal disimpan.";
+      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, `⚠️ ${message}`);
+    }
+  }
+
   async function processAssistantRequest(
     ctx: Context,
     text: string,
@@ -372,6 +504,7 @@ export function createTelegramBot(
     const liveTrace = dependencies.traces.isLiveEnabled(chatId);
     let progress: ProgressController | null = null;
     let typingTimer: NodeJS.Timeout | null = null;
+    const requestedFileIds = new Set<number>();
 
     try {
       const initialMessage = await ctx.reply(
@@ -407,6 +540,10 @@ export function createTelegramBot(
       }
 
       const onEvent = (event: AssistantEvent) => {
+        if (event.type === "file") {
+          requestedFileIds.add(event.itemId);
+          return;
+        }
         if (event.type === "usage") {
           dependencies.traces.addUsage(trace.requestId, event.inputTokens, event.outputTokens);
           return;
@@ -446,6 +583,7 @@ export function createTelegramBot(
         await progress.finish(chunks[0] ?? "Selesai.");
         for (const chunk of chunks.slice(1)) await ctx.reply(chunk);
       }
+      for (const itemId of requestedFileIds) await sendVaultFile(ctx, itemId);
     } catch (error) {
       const aborted = isAbortError(error, active.controller.signal);
       const status = active.timedOut ? "timeout" : aborted ? "cancelled" : "failed";
@@ -601,6 +739,189 @@ export function createTelegramBot(
     await ctx.reply(`Semua memori personal sudah dihapus (${deleted} item).`);
   });
 
+  bot.command("vault", async (ctx) => {
+    const requestedPath = commandArguments(ctx.message?.text);
+    const folder = requestedPath ? dependencies.vault.resolveFolderPath(requestedPath) : null;
+    if (requestedPath && !folder) {
+      await ctx.reply(`Folder \"${requestedPath}\" tidak ditemukan.`);
+      return;
+    }
+    const items = dependencies.vault.list(folder?.id ?? null);
+    if (items.length === 0) {
+      await ctx.reply(`Vault ${requestedPath ? `/${requestedPath}` : "/"} masih kosong.`);
+      return;
+    }
+    const lines = items.map((item) => {
+      const icon = item.kind === "folder" ? "📁" : item.kind === "note" ? "📝" : "📄";
+      const size = item.kind === "folder" ? "" : ` · ${formatBytes(item.sizeBytes)}`;
+      return `${icon} #${item.id} ${item.name}${size}`;
+    });
+    await ctx.reply(`Isi vault ${requestedPath ? `/${requestedPath}` : "/"}:\n${lines.join("\n")}`);
+  });
+
+  bot.command("mkdir", async (ctx) => {
+    const folderPath = commandArguments(ctx.message?.text);
+    if (!folderPath) {
+      await ctx.reply("Format: /mkdir <folder/subfolder>");
+      return;
+    }
+    try {
+      const folder = dependencies.vault.ensureFolderPath(folderPath);
+      await ctx.reply(`📁 Folder siap: ${folder ? dependencies.vault.pathFor(folder.id) : "/"}`);
+    } catch (error) {
+      await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "Folder gagal dibuat."}`);
+    }
+  });
+
+  bot.command("save", async (ctx) => {
+    const args = commandArguments(ctx.message?.text);
+    const replied = ctx.message?.reply_to_message;
+    if (replied?.document) {
+      await saveTelegramFile(ctx, {
+        fileId: replied.document.file_id,
+        fileName: replied.document.file_name ?? `Dokumen Telegram ${replied.message_id}`,
+        ...(replied.document.mime_type ? { mimeType: replied.document.mime_type } : {}),
+        ...(replied.document.file_size ? { fileSize: replied.document.file_size } : {}),
+        ...(args ? { folderPath: args } : {}),
+      });
+      return;
+    }
+    if (replied?.photo) {
+      const photo = selectLargestPhoto(replied.photo);
+      if (!photo) {
+        await ctx.reply("Foto yang dibalas tidak dapat diunduh.");
+        return;
+      }
+      await saveTelegramFile(ctx, {
+        fileId: photo.file_id,
+        fileName: generatedPhotoName(replied.message_id),
+        mimeType: "image/jpeg",
+        ...(photo.file_size ? { fileSize: photo.file_size } : {}),
+        ...(args ? { folderPath: args } : {}),
+      });
+      return;
+    }
+    if (replied?.text || replied?.caption) {
+      const content = replied.text ?? replied.caption ?? "";
+      const [namePart, folderPart] = args.split("|", 2).map((part) => part.trim());
+      const name = namePart || generatedNoteName(content, replied.message_id);
+      try {
+        const parent = folderPart ? dependencies.vault.ensureFolderPath(folderPart) : null;
+        const item = dependencies.vault.saveNote(name, content, parent?.id ?? null, {
+          chatId: String(ctx.chat.id),
+          messageId: String(replied.message_id),
+        });
+        await ctx.reply(`✅ Catatan disimpan: ${dependencies.vault.pathFor(item.id)} (#${item.id})`);
+      } catch (error) {
+        const message =
+          error instanceof DuplicateVaultItemError
+            ? `Nama duplikat: ${error.existing.name} sudah ada sebagai #${error.existing.id}.`
+            : error instanceof Error
+              ? error.message
+              : "Catatan gagal disimpan.";
+        await ctx.reply(`⚠️ ${message}`);
+      }
+      return;
+    }
+    const separator = args.indexOf("|");
+    if (separator < 1 || !args.slice(separator + 1).trim()) {
+      await ctx.reply(
+        "Balas sebuah chat/file dengan /save. Untuk catatan baru gunakan: /save Judul | Isi catatan",
+      );
+      return;
+    }
+    try {
+      const item = dependencies.vault.saveNote(
+        args.slice(0, separator).trim(),
+        args.slice(separator + 1).trim(),
+        null,
+        { chatId: String(ctx.chat.id), messageId: String(ctx.message?.message_id ?? "") },
+      );
+      await ctx.reply(`✅ Catatan disimpan: ${dependencies.vault.pathFor(item.id)} (#${item.id})`);
+    } catch (error) {
+      await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "Catatan gagal disimpan."}`);
+    }
+  });
+
+  bot.command("find", async (ctx) => {
+    const query = commandArguments(ctx.message?.text);
+    if (!query) {
+      await ctx.reply("Format: /find <kata pencarian>");
+      return;
+    }
+    const items = dependencies.vault.search(query, 20);
+    if (items.length === 0) {
+      await ctx.reply(`Tidak ada item vault yang cocok dengan \"${query}\".`);
+      return;
+    }
+    await ctx.reply(
+      items
+        .map((item) => `${item.kind === "folder" ? "📁" : item.kind === "note" ? "📝" : "📄"} #${item.id} ${dependencies.vault.pathFor(item.id)}`)
+        .join("\n"),
+    );
+  });
+
+  bot.command("get", async (ctx) => {
+    const id = commandId(ctx.message?.text);
+    if (!id) {
+      await ctx.reply("Format: /get <id-file>");
+      return;
+    }
+    try {
+      await sendVaultFile(ctx, id);
+    } catch (error) {
+      await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "File gagal dikirim."}`);
+    }
+  });
+
+  bot.command("rename", async (ctx) => {
+    const match = commandArguments(ctx.message?.text).match(/^(\d+)\s+(.+)$/u);
+    if (!match?.[1] || !match[2]) {
+      await ctx.reply("Format: /rename <id> <nama baru>");
+      return;
+    }
+    try {
+      const item = dependencies.vault.rename(Number(match[1]), match[2]);
+      await ctx.reply(`✅ Nama diubah: ${dependencies.vault.pathFor(item.id)}`);
+    } catch (error) {
+      await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "Nama gagal diubah."}`);
+    }
+  });
+
+  bot.command("move", async (ctx) => {
+    const match = commandArguments(ctx.message?.text).match(/^(\d+)\s+(.+)$/u);
+    if (!match?.[1] || !match[2]) {
+      await ctx.reply("Format: /move <id> <folder tujuan|/>");
+      return;
+    }
+    try {
+      const requestedPath = match[2].trim();
+      const parent = requestedPath === "/" ? null : dependencies.vault.resolveFolderPath(requestedPath);
+      if (requestedPath !== "/" && !parent) {
+        await ctx.reply(`Folder \"${requestedPath}\" tidak ditemukan.`);
+        return;
+      }
+      const item = dependencies.vault.move(Number(match[1]), parent?.id ?? null);
+      await ctx.reply(`✅ Item dipindahkan: ${dependencies.vault.pathFor(item.id)}`);
+    } catch (error) {
+      await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "Item gagal dipindahkan."}`);
+    }
+  });
+
+  bot.command("delete_item", async (ctx) => {
+    const match = commandArguments(ctx.message?.text).match(/^(\d+)\s+CONFIRM$/u);
+    if (!match?.[1]) {
+      await ctx.reply("Format: /delete_item <id> CONFIRM");
+      return;
+    }
+    try {
+      const deleted = dependencies.vault.delete(Number(match[1]));
+      await ctx.reply(`🗑️ Item dihapus (${deleted} item termasuk isi folder).`);
+    } catch (error) {
+      await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "Item gagal dihapus."}`);
+    }
+  });
+
   bot.command("watches", async (ctx) => {
     const rules = dependencies.emailRules.list();
     if (rules.length === 0) {
@@ -700,6 +1021,7 @@ export function createTelegramBot(
   });
 
   bot.command("status", async (ctx) => {
+    const vaultStats = dependencies.vault.stats();
     await ctx.reply(
       [
         "Status layanan:",
@@ -711,6 +1033,8 @@ export function createTelegramBot(
         `• Trace live: ${dependencies.traces.isLiveEnabled(String(ctx.chat.id)) ? "aktif" : "nonaktif"}`,
         `• Gmail: ${dependencies.gmailConfigured ? "terhubung" : "belum dikonfigurasi"}`,
         `• Web search: ${dependencies.search.available ? dependencies.search.name : "belum dikonfigurasi"}`,
+        `• Vault: ${vaultStats.files} file, ${vaultStats.notes} catatan, ${vaultStats.folders} folder (${formatBytes(vaultStats.totalBytes)})`,
+        `• Dashboard: ${config.DASHBOARD_ENABLED ? `aktif di port ${config.PORT}` : "nonaktif"}`,
         `• Dead-letter email/notifikasi: ${dependencies.emailRules.terminalFailureCount()}`,
         `• Zona waktu: ${config.TIMEZONE}`,
       ].join("\n"),
@@ -721,6 +1045,16 @@ export function createTelegramBot(
     const photo = selectLargestPhoto(ctx.message.photo);
     if (!photo) {
       await ctx.reply("Foto tidak memiliki versi yang dapat diunduh.");
+      return;
+    }
+    if (/^\/save(?:@\w+)?(?:\s|$)/u.test(ctx.message.caption ?? "") || ctx.message.forward_origin) {
+      await saveTelegramFile(ctx, {
+        fileId: photo.file_id,
+        fileName: generatedPhotoName(ctx.message.message_id),
+        mimeType: "image/jpeg",
+        ...(photo.file_size ? { fileSize: photo.file_size } : {}),
+        ...(ctx.message.caption ? { folderPath: commandArguments(ctx.message.caption) } : {}),
+      });
       return;
     }
     await receiveImage(
@@ -734,6 +1068,19 @@ export function createTelegramBot(
 
   bot.on("message:document", async (ctx) => {
     const document = ctx.message.document;
+    const saveCaption = /^\/save(?:@\w+)?(?:\s|$)/u.test(ctx.message.caption ?? "");
+    if (!document.mime_type?.startsWith("image/") || saveCaption || ctx.message.forward_origin) {
+      await saveTelegramFile(ctx, {
+        fileId: document.file_id,
+        fileName: document.file_name ?? `Dokumen Telegram ${ctx.message.message_id}`,
+        ...(document.mime_type ? { mimeType: document.mime_type } : {}),
+        ...(document.file_size ? { fileSize: document.file_size } : {}),
+        ...(saveCaption && ctx.message.caption
+          ? { folderPath: commandArguments(ctx.message.caption) }
+          : {}),
+      });
+      return;
+    }
     if (!document.mime_type?.startsWith("image/")) {
       await ctx.reply("Dokumen ini bukan gambar. Format gambar yang didukung: JPEG, PNG, WebP, GIF.");
       return;
@@ -749,6 +1096,20 @@ export function createTelegramBot(
 
   bot.on("message:text", async (ctx) => {
     if (await replyIfBusy(ctx)) return;
+    if (ctx.message.forward_origin) {
+      try {
+        const item = dependencies.vault.saveNote(
+          generatedNoteName(ctx.message.text, ctx.message.message_id),
+          ctx.message.text,
+          null,
+          { chatId: String(ctx.chat.id), messageId: String(ctx.message.message_id) },
+        );
+        await ctx.reply(`✅ Chat diteruskan dan disimpan: ${dependencies.vault.pathFor(item.id)} (#${item.id})`);
+      } catch (error) {
+        await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "Chat gagal disimpan."}`);
+      }
+      return;
+    }
     const pendingImage = takePendingImage(String(ctx.chat.id));
     await processAssistantRequest(ctx, ctx.message.text, pendingImage ?? undefined);
   });

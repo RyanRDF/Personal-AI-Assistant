@@ -23,4 +23,10 @@ describe("Railway deployment config", () => {
     expect(dockerfile).not.toMatch(/^\s*VOLUME\b/imu);
     expect(dockerfile).toContain("RUN mkdir -p /app/data");
   });
+
+  it("exposes the dashboard health server outside the Docker container", () => {
+    const dockerfile = fs.readFileSync(path.resolve("Dockerfile"), "utf8");
+
+    expect(dockerfile).toContain("ENV DASHBOARD_HOST=0.0.0.0");
+  });
 });

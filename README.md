@@ -362,7 +362,7 @@ Perintah:
 - `/memory` melihat memori.
 - `/forget <id>` menghapus satu memori.
 - `/clear_memory CONFIRM` menghapus seluruh memori personal.
-- `/clear_chat` menghapus riwayat pendek tanpa menghapus memori.
+- `/clear_chat CONFIRM` menghapus riwayat pendek dan pesan Telegram yang tercatat dalam batas 48 jam Bot API, tanpa menghapus memori atau isi vault. Pesan yang lebih lama harus dihapus manual melalui aplikasi Telegram.
 
 Memori memakai pencarian lexical lokal agar tidak membutuhkan embedding API dan tidak menambah biaya. Preferensi selalu tersedia sebagai konteks, sedangkan fakta lain hanya dimuat bila relevan dengan pertanyaan. Riwayat chat yang lebih lama dari `MESSAGE_RETENTION_DAYS` (default 90 hari) dibersihkan saat startup. Desain provider memungkinkan semantic/embedding retrieval ditambahkan nanti.
 
@@ -584,7 +584,7 @@ File `.env` juga perlu dicadangkan secara aman, terpisah dari Git. Jangan menaru
 | `/pause_watch <id>` | Jeda aturan |
 | `/resume_watch <id>` | Aktifkan aturan |
 | `/delete_watch <id>` | Hapus aturan |
-| `/clear_chat` | Hapus riwayat chat pendek |
+| `/clear_chat CONFIRM` | Reset konteks AI dan hapus pesan Telegram tercatat hingga 48 jam terakhir |
 
 Selain perintah tersebut, gunakan bahasa natural untuk bertanya, menerjemahkan, mencari, menyimpan preferensi, atau membuat aturan email.
 

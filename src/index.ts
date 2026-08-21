@@ -12,6 +12,7 @@ import { EmailWatcher } from "./services/email-watcher.js";
 import { GmailService } from "./services/gmail.js";
 import { MemoryService } from "./services/memory.js";
 import { RequestTraceService } from "./services/request-trace.js";
+import { TelegramHistoryService } from "./services/telegram-history.js";
 import { VaultService } from "./services/vault.js";
 import { createSearchProvider } from "./services/web-search.js";
 import { createTelegramBot, splitTelegramMessage } from "./telegram/bot.js";
@@ -24,6 +25,12 @@ async function main(): Promise<void> {
   const prunedMessages = conversations.pruneOlderThan(config.MESSAGE_RETENTION_DAYS);
   if (prunedMessages > 0) {
     logger.info({ prunedMessages }, "Expired conversation messages deleted");
+  }
+  const telegramHistory = new TelegramHistoryService(database);
+  const telegramDeleteCutoff = Math.floor(Date.now() / 1000) - 48 * 60 * 60;
+  const prunedTelegramMessages = telegramHistory.pruneBefore(telegramDeleteCutoff);
+  if (prunedTelegramMessages > 0) {
+    logger.info({ prunedTelegramMessages }, "Expired Telegram message references deleted");
   }
   const memories = new MemoryService(database);
   const vault = new VaultService(database, config.VAULT_STORAGE_PATH);
@@ -50,6 +57,7 @@ async function main(): Promise<void> {
     emailRules,
     search,
     traces,
+    telegramHistory,
     gmailConfigured,
   });
   await bot.init();
@@ -70,7 +78,7 @@ async function main(): Promise<void> {
     { command: "trace", description: "Atur detail proses: /trace on atau off" },
     { command: "last_trace", description: "Lihat trace permintaan terakhir" },
     { command: "cancel", description: "Batalkan permintaan aktif" },
-    { command: "clear_chat", description: "Hapus riwayat percakapan pendek" },
+    { command: "clear_chat", description: "Reset konteks dan hapus chat terbaru" },
     { command: "help", description: "Lihat bantuan" },
   ]);
   const dashboard = await startDashboard(config, { database, vault, logger });

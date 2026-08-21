@@ -17,6 +17,15 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_created
   ON messages(chat_id, id DESC);
 
+CREATE TABLE IF NOT EXISTS telegram_messages (
+  chat_id TEXT NOT NULL,
+  message_id INTEGER NOT NULL,
+  sent_at INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_messages_chat_sent
+  ON telegram_messages(chat_id, sent_at DESC);
+
 CREATE TABLE IF NOT EXISTS memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL CHECK (kind IN ('preference', 'fact', 'commitment', 'other')),

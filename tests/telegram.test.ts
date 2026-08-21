@@ -5,6 +5,7 @@ import {
   resolveImageMimeType,
   selectLargestPhoto,
   splitTelegramMessage,
+  telegramMessageReferences,
 } from "../src/telegram/bot.js";
 
 describe("Telegram safety and formatting", () => {
@@ -43,5 +44,15 @@ describe("Telegram safety and formatting", () => {
     expect(imageBytesToDataUrl(Uint8Array.from([1, 2, 3]), "image/png")).toBe(
       "data:image/png;base64,AQID",
     );
+  });
+
+  it("extracts trackable messages from Telegram API results", () => {
+    expect(
+      telegramMessageReferences([
+        { message_id: 7, date: 1_700_000_000, chat: { id: 42 } },
+        true,
+        { file_id: "not-a-message" },
+      ]),
+    ).toEqual([{ chatId: "42", messageId: 7, sentAt: 1_700_000_000 }]);
   });
 });

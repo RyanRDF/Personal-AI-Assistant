@@ -20,6 +20,7 @@ import {
   type RequestTrace,
   type RequestTraceService,
 } from "../services/request-trace.js";
+import type { TelegramHistoryService } from "../services/telegram-history.js";
 import type { WebSearchProvider } from "../services/web-search.js";
 
 const HELP_TEXT = `Asisten personal siap digunakan.
@@ -50,7 +51,7 @@ Perintah:
 /delete_watch <id> — hapus aturan email
 /pause_watch <id> — jeda aturan email
 /resume_watch <id> — aktifkan aturan email
-/clear_chat — hapus riwayat percakapan pendek
+/clear_chat CONFIRM — reset konteks dan hapus pesan Telegram terbaru
 /trace on|off — tampilkan atau sembunyikan detail proses
 /last_trace — lihat trace permintaan terakhir
 /cancel — batalkan permintaan aktif
@@ -79,6 +80,7 @@ interface BotDependencies {
   emailRules: EmailRuleService;
   search: WebSearchProvider;
   traces: RequestTraceService;
+  telegramHistory: TelegramHistoryService;
   gmailConfigured: boolean;
 }
 
@@ -86,6 +88,8 @@ interface ActiveRequest {
   requestId: string;
   controller: AbortController;
   timedOut: boolean;
+  finished: Promise<void>;
+  resolveFinished: () => void;
 }
 
 interface PendingImage {
@@ -105,6 +109,39 @@ interface ProgressController {
 }
 
 class ImageInputError extends Error {}
+
+interface TelegramMessageReference {
+  chatId: string;
+  messageId: number;
+  sentAt: number;
+}
+
+const TELEGRAM_DELETE_WINDOW_SECONDS = 48 * 60 * 60;
+const TELEGRAM_DELETE_BATCH_SIZE = 100;
+
+function telegramMessageReferences(result: unknown): TelegramMessageReference[] {
+  const values = Array.isArray(result) ? result : [result];
+  const references: TelegramMessageReference[] = [];
+  for (const value of values) {
+    if (!value || typeof value !== "object") continue;
+    const message = value as Record<string, unknown>;
+    const chat = message.chat;
+    if (!chat || typeof chat !== "object") continue;
+    const chatId = (chat as Record<string, unknown>).id;
+    if (
+      typeof chatId === "number" &&
+      typeof message.message_id === "number" &&
+      typeof message.date === "number"
+    ) {
+      references.push({
+        chatId: String(chatId),
+        messageId: message.message_id,
+        sentAt: message.date,
+      });
+    }
+  }
+  return references;
+}
 
 function splitTelegramMessage(text: string, maxLength = 4000): string[] {
   if (text.length <= maxLength) return [text];
@@ -394,6 +431,27 @@ export function createTelegramBot(
   const pendingImages = new Map<string, PendingImage>();
   const pendingImageDownloads = new Map<string, PendingImageDownload>();
 
+  bot.api.config.use(async (previous, method, payload, signal) => {
+    const response = await previous(method, payload, signal);
+    if (response.ok) {
+      try {
+        for (const reference of telegramMessageReferences(response.result)) {
+          dependencies.telegramHistory.record(
+            reference.chatId,
+            reference.messageId,
+            reference.sentAt,
+          );
+        }
+      } catch (error) {
+        logger.error(
+          { errorMessage: safeErrorMessage(error) },
+          "Telegram outgoing message tracking failed",
+        );
+      }
+    }
+    return response;
+  });
+
   function takePendingImage(
     chatId: string,
   ): AssistantImageInput | ((signal: AbortSignal) => Promise<AssistantImageInput>) | null {
@@ -491,10 +549,16 @@ export function createTelegramBot(
     }
     const inputKind = imageSource ? "image" : "text";
     const trace = dependencies.traces.start(chatId, config.OPENAI_CHAT_MODEL, inputKind);
+    let resolveFinished: () => void = () => undefined;
+    const finished = new Promise<void>((resolve) => {
+      resolveFinished = resolve;
+    });
     const active: ActiveRequest = {
       requestId: trace.requestId,
       controller: new AbortController(),
       timedOut: false,
+      finished,
+      resolveFinished,
     };
     activeRequests.set(chatId, active);
     const timeout = setTimeout(() => {
@@ -605,6 +669,7 @@ export function createTelegramBot(
       clearTimeout(timeout);
       if (typingTimer) clearInterval(typingTimer);
       if (activeRequests.get(chatId) === active) activeRequests.delete(chatId);
+      active.resolveFinished();
     }
   }
 
@@ -698,6 +763,24 @@ export function createTelegramBot(
     if (!isOwnerPrivateChat(config.TELEGRAM_ALLOWED_USER_ID, ctx.from?.id, ctx.chat?.type)) {
       await ctx.reply("Bot ini dikonfigurasi hanya untuk chat personal pemilik.");
       return;
+    }
+    await next();
+  });
+
+  bot.use(async (ctx, next) => {
+    if (ctx.message) {
+      try {
+        dependencies.telegramHistory.record(
+          String(ctx.message.chat.id),
+          ctx.message.message_id,
+          ctx.message.date,
+        );
+      } catch (error) {
+        logger.error(
+          { errorMessage: safeErrorMessage(error) },
+          "Telegram incoming message tracking failed",
+        );
+      }
     }
     await next();
   });
@@ -969,13 +1052,60 @@ export function createTelegramBot(
   bot.command("resume_watch", async (ctx) => toggleRule(ctx, true));
 
   bot.command("clear_chat", async (ctx) => {
-    const deleted = dependencies.conversations.clear(String(ctx.chat.id));
-    pendingImages.delete(String(ctx.chat.id));
-    pendingImageDownloads.get(String(ctx.chat.id))?.controller.abort(
+    if (!/^\/clear_chat(?:@\w+)?\s+CONFIRM$/u.test(ctx.message?.text ?? "")) {
+      await ctx.reply(
+        "Untuk mereset konteks AI dan menghapus pesan Telegram terbaru, kirim: /clear_chat CONFIRM\n\n" +
+          "Telegram membatasi penghapusan oleh bot hingga 48 jam terakhir. Memori dan isi vault tetap tersimpan.",
+      );
+      return;
+    }
+
+    const chatId = String(ctx.chat.id);
+    const active = activeRequests.get(chatId);
+    if (active) {
+      active.controller.abort(new Error("Cleared by Telegram owner"));
+      await active.finished;
+    }
+
+    const deleted = dependencies.conversations.clear(chatId);
+    pendingImages.delete(chatId);
+    pendingImageDownloads.get(chatId)?.controller.abort(
       new Error("Cleared by Telegram owner"),
     );
-    pendingImageDownloads.delete(String(ctx.chat.id));
-    await ctx.reply(`Riwayat percakapan pendek dihapus (${deleted} pesan). Memori tetap tersimpan.`);
+    pendingImageDownloads.delete(chatId);
+
+    // Stay clear of Telegram's exact 48-hour boundary to avoid clock-skew failures.
+    const cutoff = Math.floor(Date.now() / 1000) - TELEGRAM_DELETE_WINDOW_SECONDS + 60;
+    const messageIds = dependencies.telegramHistory.recentMessageIds(chatId, cutoff);
+    let removedTelegramMessages = 0;
+    let failedTelegramMessages = 0;
+    for (let index = 0; index < messageIds.length; index += TELEGRAM_DELETE_BATCH_SIZE) {
+      const batch = messageIds.slice(index, index + TELEGRAM_DELETE_BATCH_SIZE);
+      try {
+        await ctx.api.deleteMessages(ctx.chat.id, batch);
+        removedTelegramMessages += dependencies.telegramHistory.forget(chatId, batch);
+      } catch (error) {
+        failedTelegramMessages += batch.length;
+        logger.warn(
+          { errorMessage: safeErrorMessage(error), messageCount: batch.length },
+          "Telegram message deletion batch failed",
+        );
+      }
+    }
+    dependencies.telegramHistory.pruneBefore(cutoff);
+
+    await ctx.reply(
+      [
+        `✅ Chat direset: ${deleted} pesan konteks AI dan ${removedTelegramMessages} pesan Telegram terbaru dihapus.`,
+        "Memori personal dan isi vault tetap tersimpan.",
+        "Pesan yang lebih lama dari 48 jam atau belum pernah tercatat oleh versi bot ini perlu dihapus manual melalui aplikasi Telegram.",
+        failedTelegramMessages > 0
+          ? `⚠️ ${failedTelegramMessages} pesan belum berhasil dihapus; jalankan kembali /clear_chat CONFIRM.`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
   });
 
   bot.command("trace", async (ctx) => {
@@ -1128,4 +1258,4 @@ export function createTelegramBot(
   return bot;
 }
 
-export { splitTelegramMessage };
+export { splitTelegramMessage, telegramMessageReferences };

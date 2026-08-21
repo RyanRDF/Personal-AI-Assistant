@@ -109,7 +109,22 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "return_vault_file",
       description:
-        "Kirim kembali file vault ke chat Telegram pemilik. Panggil setelah menemukan ID file yang tepat.",
+        "Kirim kembali item vault bertipe file ke chat Telegram pemilik. Jangan gunakan untuk note.",
+      strict: true,
+      parameters: {
+        type: "object",
+        properties: { id: { type: "integer", minimum: 1 } },
+        required: ["id"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "reveal_vault_note",
+      description:
+        "Tampilkan isi note vault milik pengguna, termasuk credential yang sengaja disimpan sendiri. Tool hanya tersedia ketika pemilik secara eksplisit meminta credential tersebut pada pesan saat ini.",
       strict: true,
       parameters: {
         type: "object",
@@ -227,6 +242,7 @@ const searchVaultArgsSchema = z.object({
 });
 const listVaultArgsSchema = z.object({ folder: z.string().max(500).nullable() });
 const returnVaultFileArgsSchema = z.object({ id: z.number().int().positive() });
+const revealVaultNoteArgsSchema = z.object({ id: z.number().int().positive() });
 
 export interface AssistantImageInput {
   dataUrl: string;
@@ -276,6 +292,7 @@ function toolLabel(name: string): string {
     search_vault: "Mencari isi vault",
     list_vault: "Membaca folder vault",
     return_vault_file: "Menyiapkan file vault",
+    reveal_vault_note: "Membuka catatan rahasia vault",
   };
   return labels[name] ?? `Menjalankan ${name}`;
 }
@@ -316,6 +333,10 @@ export function authorizedToolNames(userText: string): Set<string> {
   const vaultFolderIntent = /^(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:buat(?:kan)?|bikin(?:kan)?|tambah(?:kan)?)\b.{0,100}\b(?:folder|direktori|rak)\b/isu.test(
     intentText,
   );
+  const credentialRevealIntent =
+    /^(?:(?:ya|iya),?\s+)?(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:tampilkan|perlihatkan|berikan|kasih|kirim|buka|bacakan|ungkapkan|ambilkan|minta|reveal|show|give|get|saya\s+(?:mau|butuh|ingin))\b.{0,220}\b(?:akun|account|username|user\s*name|password|pass(?:word)?|pw|kata\s+sandi|sandi|credential|kredensial|secret|rahasia)\b/isu.test(
+      intentText,
+    );
   if (memoryIntent && !vaultSaveIntent) {
     allowed.add("remember");
     allowed.add("update_memory");
@@ -323,6 +344,7 @@ export function authorizedToolNames(userText: string): Set<string> {
   if (emailWatchIntent) allowed.add("create_email_watch");
   if (vaultSaveIntent) allowed.add("save_vault_note");
   if (vaultFolderIntent) allowed.add("create_vault_folder");
+  if (credentialRevealIntent) allowed.add("reveal_vault_note");
   return allowed;
 }
 
@@ -446,6 +468,7 @@ export class PersonalAssistant {
           call.function.name,
           call.function.arguments,
           allowedToolNames,
+          chatId,
           options,
         );
         messages.push({ role: "tool", tool_call_id: call.id, content: result });
@@ -536,6 +559,7 @@ export class PersonalAssistant {
     name: string,
     rawArguments: string,
     allowedToolNames: Set<string>,
+    chatId: string,
     options: AssistantReplyOptions,
   ): Promise<string> {
     try {
@@ -626,12 +650,37 @@ export class PersonalAssistant {
         case "return_vault_file": {
           const { id } = returnVaultFileArgsSchema.parse(parsed);
           const item = this.dependencies.vault.get(id);
-          if (!item || item.kind !== "file") {
+          if (!item) {
             return JSON.stringify({ error: `File vault ${id} tidak ditemukan.` });
+          }
+          if (item.kind !== "file") {
+            return JSON.stringify({
+              error: `Item vault ${id} adalah ${item.kind}, bukan file. Gunakan reveal_vault_note untuk note bila permintaan credential telah diotorisasi.`,
+            });
           }
           // The Telegram adapter handles the actual send after the assistant response.
           this.emit(options, { type: "file", itemId: id });
           return JSON.stringify({ queued: true, id, name: item.name });
+        }
+        case "reveal_vault_note": {
+          if (chatId !== String(this.config.TELEGRAM_ALLOWED_USER_ID)) {
+            return JSON.stringify({ error: "Isi note hanya dapat dibuka oleh pemilik bot." });
+          }
+          const { id } = revealVaultNoteArgsSchema.parse(parsed);
+          const item = this.dependencies.vault.get(id);
+          if (!item) return JSON.stringify({ error: `Item vault ${id} tidak ditemukan.` });
+          if (item.kind !== "note" || item.content === null) {
+            return JSON.stringify({ error: `Item vault ${id} bukan note yang dapat ditampilkan.` });
+          }
+          return JSON.stringify({
+            revealed: true,
+            item: {
+              id: item.id,
+              name: item.name,
+              path: this.dependencies.vault.pathFor(item.id),
+              content: item.content,
+            },
+          });
         }
         default:
           return JSON.stringify({ error: `Tool tidak dikenal: ${name}` });

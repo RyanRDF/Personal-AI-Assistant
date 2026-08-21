@@ -102,4 +102,114 @@ describe("assistant vault tools", () => {
       setup.cleanup();
     }
   });
+
+  it("reveals an explicitly requested credential note to the configured owner", async () => {
+    const setup = temporaryDatabase();
+    try {
+      const config = testConfig();
+      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const note = vault.saveNote(
+        "Railway Dashboard - admin",
+        "username: owner@example.test\npassword: dummy-password",
+      );
+      const create = vi
+        .fn()
+        .mockResolvedValueOnce(
+          fakeStream([
+            {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "call-search-note",
+                        function: {
+                          name: "search_vault",
+                          arguments: '{"query":"Railway Dashboard admin","limit":5}',
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          fakeStream([
+            {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "call-reveal-note",
+                        function: {
+                          name: "reveal_vault_note",
+                          arguments: JSON.stringify({ id: note.id }),
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          fakeStream([
+            {
+              choices: [
+                {
+                  delta: {
+                    content:
+                      "Username: owner@example.test\nPassword: dummy-password",
+                  },
+                },
+              ],
+            },
+          ]),
+        );
+      const client = { chat: { completions: { create } } } as unknown as OpenAI;
+      const events: AssistantEvent[] = [];
+      const assistant = new PersonalAssistant(
+        config,
+        setup.database,
+        createLogger(config),
+        {
+          conversations: new ConversationService(setup.database),
+          memories: new MemoryService(setup.database),
+          vault,
+          emailRules: new EmailRuleService(setup.database),
+          gmail: null,
+          search: { name: "test", available: false, async search() { return []; } },
+        },
+        client,
+      );
+
+      const answer = await assistant.reply(
+        String(config.TELEGRAM_ALLOWED_USER_ID),
+        "Tolong tampilkan akun dan password dashboard Railway yang saya simpan.",
+        { onEvent: (event) => events.push(event) },
+      );
+
+      expect(answer).toContain("owner@example.test");
+      expect(answer).toContain("dummy-password");
+      expect(events).not.toContainEqual({ type: "file", itemId: note.id });
+      expect(create).toHaveBeenCalledTimes(3);
+      const revealRequest = create.mock.calls[2]?.[0] as {
+        messages: Array<{ role: string; content: string }>;
+      };
+      expect(revealRequest.messages).toContainEqual(
+        expect.objectContaining({
+          role: "tool",
+          content: expect.stringContaining('"revealed":true'),
+        }),
+      );
+    } finally {
+      setup.cleanup();
+    }
+  });
 });

@@ -145,9 +145,9 @@ describe("assistant vault tools", () => {
                     tool_calls: [
                       {
                         index: 0,
-                        id: "call-reveal-note",
+                        id: "call-read-note",
                         function: {
-                          name: "reveal_vault_note",
+                          name: "read_vault_note",
                           arguments: JSON.stringify({ id: note.id }),
                         },
                       },
@@ -205,8 +205,170 @@ describe("assistant vault tools", () => {
       expect(revealRequest.messages).toContainEqual(
         expect.objectContaining({
           role: "tool",
-          content: expect.stringContaining('"revealed":true'),
+          content: expect.stringContaining('"read":true'),
         }),
+      );
+    } finally {
+      setup.cleanup();
+    }
+  });
+
+  it("stores a bare dashboard URL directly in the related vault note", async () => {
+    const setup = temporaryDatabase();
+    try {
+      const config = testConfig();
+      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const note = vault.saveNote("Railway Dashboard - admin", "username: admin");
+      const create = vi
+        .fn()
+        .mockResolvedValueOnce(
+          fakeStream([
+            {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "call-write-note",
+                        function: {
+                          name: "write_vault_note",
+                          arguments: JSON.stringify({
+                            operation: "append",
+                            id: note.id,
+                            name: null,
+                            content:
+                              "https://personal-ai-assistant-production-88a2.up.railway.app",
+                            folder: null,
+                          }),
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          fakeStream([
+            {
+              choices: [
+                {
+                  delta: {
+                    content:
+                      "Sudah disimpan: https://personal-ai-assistant-production-88a2.up.railway.app",
+                  },
+                },
+              ],
+            },
+          ]),
+        );
+      const client = { chat: { completions: { create } } } as unknown as OpenAI;
+      const assistant = new PersonalAssistant(
+        config,
+        setup.database,
+        createLogger(config),
+        {
+          conversations: new ConversationService(setup.database),
+          memories: new MemoryService(setup.database),
+          vault,
+          emailRules: new EmailRuleService(setup.database),
+          gmail: null,
+          search: { name: "test", available: false, async search() { return []; } },
+        },
+        client,
+      );
+
+      const answer = await assistant.reply(
+        String(config.TELEGRAM_ALLOWED_USER_ID),
+        "personal-ai-assistant-production-88a2.up.railway.app\nTolong simpen ini sebagai link untuk ke dashboard railway",
+      );
+
+      const stored = vault.get(note.id);
+      expect(stored?.content).toBe(
+        "username: admin\nhttps://personal-ai-assistant-production-88a2.up.railway.app",
+      );
+      expect(answer).toBe(
+        "Sudah disimpan: https://personal-ai-assistant-production-88a2.up.railway.app",
+      );
+      expect(create).toHaveBeenCalledTimes(2);
+      const followupRequest = create.mock.calls[1]?.[0] as {
+        messages: Array<{ role: string; content: string }>;
+      };
+      expect(followupRequest.messages).toContainEqual(
+        expect.objectContaining({
+          role: "tool",
+          content: expect.stringContaining('"operation":"append"'),
+        }),
+      );
+    } finally {
+      setup.cleanup();
+    }
+  });
+
+  it("creates a general note from a direct everyday request", async () => {
+    const setup = temporaryDatabase();
+    try {
+      const config = testConfig();
+      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const create = vi
+        .fn()
+        .mockResolvedValueOnce(
+          fakeStream([
+            {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "call-create-note",
+                        function: {
+                          name: "write_vault_note",
+                          arguments: JSON.stringify({
+                            operation: "create",
+                            id: null,
+                            name: "Daftar belanja",
+                            content: "Susu\nRoti",
+                            folder: null,
+                          }),
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          fakeStream([{ choices: [{ delta: { content: "Daftar belanja sudah disimpan." } }] }]),
+        );
+      const client = { chat: { completions: { create } } } as unknown as OpenAI;
+      const assistant = new PersonalAssistant(
+        config,
+        setup.database,
+        createLogger(config),
+        {
+          conversations: new ConversationService(setup.database),
+          memories: new MemoryService(setup.database),
+          vault,
+          emailRules: new EmailRuleService(setup.database),
+          gmail: null,
+          search: { name: "test", available: false, async search() { return []; } },
+        },
+        client,
+      );
+
+      const answer = await assistant.reply(
+        String(config.TELEGRAM_ALLOWED_USER_ID),
+        "Tolong simpan daftar belanja: susu dan roti.",
+      );
+
+      expect(answer).toBe("Daftar belanja sudah disimpan.");
+      expect(vault.search("susu", 5)[0]).toEqual(
+        expect.objectContaining({ name: "Daftar belanja", content: "Susu\nRoti" }),
       );
     } finally {
       setup.cleanup();

@@ -233,6 +233,40 @@ export class VaultService {
     return this.get(Number(result.lastInsertRowid))!;
   }
 
+  updateNote(id: number, content: string, mode: "append" | "replace"): VaultItem {
+    const item = this.requireItem(id);
+    if (item.kind !== "note") {
+      throw new InvalidVaultOperationError(`Item vault ${id} bukan note.`);
+    }
+    const normalizedContent = content.trim();
+    if (!normalizedContent) throw new InvalidVaultOperationError("Isi catatan tidak boleh kosong.");
+    const currentContent = item.content ?? "";
+    const alreadyPresent =
+      currentContent === normalizedContent ||
+      currentContent.startsWith(`${normalizedContent}\n`) ||
+      currentContent.endsWith(`\n${normalizedContent}`) ||
+      currentContent.includes(`\n${normalizedContent}\n`);
+    if (mode === "append" && alreadyPresent) return item;
+    const updatedContent =
+      mode === "replace"
+        ? normalizedContent
+        : currentContent
+          ? `${currentContent}\n${normalizedContent}`
+          : normalizedContent;
+    if (updatedContent.length > 10_000) {
+      throw new InvalidVaultOperationError("Isi catatan maksimal 10.000 karakter.");
+    }
+    if (updatedContent === currentContent) return item;
+    this.database
+      .prepare(
+        `UPDATE vault_items
+         SET content = ?, size_bytes = ?, updated_at = datetime('now')
+         WHERE id = ?`,
+      )
+      .run(updatedContent, Buffer.byteLength(updatedContent, "utf8"), id);
+    return this.get(id)!;
+  }
+
   saveFile(input: SaveVaultFileInput): VaultItem {
     const parentId = input.parentId ?? null;
     this.assertFolder(parentId);

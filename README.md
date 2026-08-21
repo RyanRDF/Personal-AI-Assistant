@@ -370,7 +370,9 @@ Memori memakai pencarian lexical lokal agar tidak membutuhkan embedding API dan 
 
 Forward chat atau dokumen non-gambar ke bot untuk menyimpannya langsung. Foto dan dokumen gambar hanya masuk vault bila merupakan forward atau memakai caption `/save [folder]`; selain itu alur analisis gambar tetap berlaku. Untuk menyimpan chat yang sudah ada, reply pesan tersebut dengan `/save [judul] | [folder opsional]`.
 
-Bot dapat menampilkan kembali credential pribadi yang sengaja disimpan sebagai note vault ketika pemilik memintanya secara eksplisit, misalnya `Tampilkan akun dan password dashboard Railway yang saya simpan`. Akses ini hanya bekerja dari private chat dengan `TELEGRAM_ALLOWED_USER_ID`; secret runtime aplikasi seperti API key, token bot, environment variable, dan isi log tetap tidak dapat diungkapkan. Karena hasilnya terlihat di riwayat Telegram, hapus pesan setelah digunakan atau jalankan `/clear_chat CONFIRM` bila sesuai.
+Bot dapat membaca kembali isi note apa pun yang diminta pemilik, termasuk credential pribadi yang sengaja disimpan sendiri, misalnya `Tampilkan akun dan password dashboard Railway yang saya simpan`. Akses ini hanya bekerja dari private chat dengan `TELEGRAM_ALLOWED_USER_ID`; secret runtime aplikasi seperti API key, token bot, environment variable, dan isi log tetap tidak dapat diambil. Karena hasilnya terlihat di riwayat Telegram, hapus pesan setelah digunakan atau jalankan `/clear_chat CONFIRM` bila sesuai.
+
+Operasi note memakai kemampuan umum untuk membuat, menambahkan, atau mengganti konten. Permintaan jelas dieksekusi langsung tanpa konfirmasi format atau saran tambahan. Contoh: kirim `personal-ai-assistant-production.up.railway.app` lalu tulis `Tolong simpan ini sebagai link dashboard Railway`; bot memakai `https://`, menambahkannya ke note terkait, dan nanti menjawab `Berikan link dashboard Railway` dari vault tanpa pencarian web. Prinsip yang sama berlaku untuk catatan, agenda, akun, alamat, dan data pribadi lain.
 
 Contoh alur:
 

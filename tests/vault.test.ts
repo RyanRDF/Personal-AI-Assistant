@@ -48,6 +48,20 @@ describe("vault storage", () => {
     expect(() => vault.move(parent.id, child.id)).toThrow(InvalidVaultOperationError);
   });
 
+  it("appends and replaces note content idempotently", () => {
+    const note = vault.saveNote("Dashboard", "username: admin");
+    const addition = "URL: https://example.test/dashboard\nStatus: production";
+    expect(vault.updateNote(note.id, addition, "append").content).toBe(
+      `username: admin\n${addition}`,
+    );
+    expect(vault.updateNote(note.id, addition, "append").content).toBe(
+      `username: admin\n${addition}`,
+    );
+    expect(vault.updateNote(note.id, "catatan pengganti", "replace").content).toBe(
+      "catatan pengganti",
+    );
+  });
+
   it("deletes nested metadata and stored file bytes", () => {
     const folder = vault.ensureFolderPath("Arsip")!;
     const file = vault.saveFile({

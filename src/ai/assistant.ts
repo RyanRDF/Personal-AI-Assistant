@@ -35,21 +35,32 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
-      name: "save_vault_note",
+      name: "write_vault_note",
       description:
-        "Simpan chat, pengingat, atau catatan penting ke vault. Gunakan hanya saat pengguna eksplisit meminta menyimpan ke vault/rak/arsip.",
+        "Buat note baru, tambahkan konten ke note, atau ganti isi note vault. Gunakan append untuk mempertahankan isi lama dan replace hanya jika pengguna meminta penggantian.",
       strict: true,
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", minLength: 1, maxLength: 180 },
+          operation: { type: "string", enum: ["create", "append", "replace"] },
+          id: {
+            type: ["integer", "null"],
+            minimum: 1,
+            description: "ID note untuk append/replace, atau null untuk create.",
+          },
+          name: {
+            type: ["string", "null"],
+            minLength: 1,
+            maxLength: 180,
+            description: "Nama note baru atau nama baru opsional saat update.",
+          },
           content: { type: "string", minLength: 1, maxLength: 10_000 },
           folder: {
             type: ["string", "null"],
-            description: "Path folder seperti Kerja/Invoice, atau null untuk root.",
+            description: "Path folder untuk create/move, atau null bila tidak perlu.",
           },
         },
-        required: ["name", "content", "folder"],
+        required: ["operation", "id", "name", "content", "folder"],
         additionalProperties: false,
       },
     },
@@ -122,9 +133,9 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
-      name: "reveal_vault_note",
+      name: "read_vault_note",
       description:
-        "Tampilkan isi note vault milik pengguna, termasuk credential yang sengaja disimpan sendiri. Tool hanya tersedia ketika pemilik secara eksplisit meminta credential tersebut pada pesan saat ini.",
+        "Baca isi lengkap note vault milik pengguna. Hanya tersedia ketika pemilik secara eksplisit meminta isi note, link, akun, atau informasi tersimpan pada pesan saat ini.",
       strict: true,
       parameters: {
         type: "object",
@@ -230,8 +241,10 @@ const gmailSearchArgsSchema = z.object({
   limit: z.number().int().min(1).max(10),
 });
 const webSearchArgsSchema = z.object({ query: z.string().min(1).max(400) });
-const saveVaultNoteArgsSchema = z.object({
-  name: z.string().min(1).max(180),
+const writeVaultNoteArgsSchema = z.object({
+  operation: z.enum(["create", "append", "replace"]),
+  id: z.number().int().positive().nullable(),
+  name: z.string().min(1).max(180).nullable(),
   content: z.string().min(1).max(10_000),
   folder: z.string().max(500).nullable(),
 });
@@ -242,7 +255,7 @@ const searchVaultArgsSchema = z.object({
 });
 const listVaultArgsSchema = z.object({ folder: z.string().max(500).nullable() });
 const returnVaultFileArgsSchema = z.object({ id: z.number().int().positive() });
-const revealVaultNoteArgsSchema = z.object({ id: z.number().int().positive() });
+const readVaultNoteArgsSchema = z.object({ id: z.number().int().positive() });
 
 export interface AssistantImageInput {
   dataUrl: string;
@@ -287,12 +300,12 @@ function toolLabel(name: string): string {
     list_email_watches: "Membaca aturan email",
     search_gmail: "Mencari Gmail",
     search_web: "Mencari web",
-    save_vault_note: "Menyimpan catatan ke vault",
+    write_vault_note: "Menulis catatan vault",
     create_vault_folder: "Membuat folder vault",
     search_vault: "Mencari isi vault",
     list_vault: "Membaca folder vault",
     return_vault_file: "Menyiapkan file vault",
-    reveal_vault_note: "Membuka catatan rahasia vault",
+    read_vault_note: "Membaca catatan vault",
   };
   return labels[name] ?? `Menjalankan ${name}`;
 }
@@ -308,15 +321,16 @@ export function authorizedToolNames(userText: string): Set<string> {
   ]);
   // Only the owner's leading request clause can authorize a local mutation. Text after a
   // colon/newline is commonly pasted email or web content and must not grant capabilities.
-  const intentText = userText.trim().split(/[:\n]/u, 1)[0]?.slice(0, 400) ?? "";
+  const intentText = userText.trim().split(/\n|:(?!\/\/)/u, 1)[0]?.slice(0, 400) ?? "";
+  const requestSample = userText.trim().slice(0, 600);
   const politePrefix = "(?:(?:tolong|mohon|please|bisakah|bisa)(?:\\s+kamu)?\\s+)?";
   const memoryIntent =
     new RegExp(
-      `^${politePrefix}(?:ingat(?:lah)?|remember|catat(?:lah)?|simpan(?:lah)?)\\b`,
+      `^${politePrefix}(?:ingat(?:lah)?|remember)\\b`,
       "iu",
     ).test(intentText) ||
     new RegExp(
-      `^${politePrefix}(?:perbarui|ubah|update)\\b.{0,100}\\b(?:memori|ingatan|preferensi|fakta)\\b`,
+      `^${politePrefix}(?:catat(?:kan|lah)?|simpan(?:kan|lah)?|simpen(?:in)?|perbarui|ubah|update)\\b.{0,120}\\b(?:memori|ingatan|preferensi|fakta)\\b`,
       "isu",
     ).test(intentText);
   const emailWatchIntent =
@@ -327,24 +341,39 @@ export function authorizedToolNames(userText: string): Set<string> {
     /^(?:kalau|jika|bila|setiap)\b.{0,180}\b(?:email|gmail)\b.{0,180}\b(?:kabari|beri tahu|beritahu|notifikasi|kirimkan?)\b/isu.test(
       intentText,
     );
-  const vaultSaveIntent = /^(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:simpan(?:lah)?|arsipkan|catat(?:lah)?)\b.{0,180}\b(?:vault|rak|arsip)\b/isu.test(
-    intentText,
-  );
+  const requestLines = requestSample.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const trailingIntent =
+    requestLines.length > 1 &&
+    /^(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:simpan|simpen|catat|tambah|masukkan|ubah|perbarui|update|arsipkan|taruh)\b/iu.test(
+      requestLines.at(-1) ?? "",
+    )
+      ? (requestLines.at(-1) ?? "").slice(0, 400)
+      : "";
+  const vaultIntentText = trailingIntent || intentText;
+  const vaultCreateIntent =
+    /^(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:simpan(?:kan|lah)?|simpen(?:in)?|save|catat(?:kan|lah)?|arsipkan|taruh)\b/iu.test(
+      vaultIntentText,
+    );
+  const vaultUpdateIntent =
+    /^(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:tambah(?:kan)?|masukkan|append|ubah|perbarui|update|replace)\b.{0,240}\b(?:vault|rak|arsip|note|catatan|link|url|dashboard|akun|account|password|credential|kredensial|data|informasi|ini)\b/isu.test(
+      vaultIntentText,
+    );
+  const vaultWriteIntent = !memoryIntent && (vaultCreateIntent || vaultUpdateIntent);
   const vaultFolderIntent = /^(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:buat(?:kan)?|bikin(?:kan)?|tambah(?:kan)?)\b.{0,100}\b(?:folder|direktori|rak)\b/isu.test(
     intentText,
   );
-  const credentialRevealIntent =
-    /^(?:(?:ya|iya),?\s+)?(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:tampilkan|perlihatkan|berikan|kasih|kirim|buka|bacakan|ungkapkan|ambilkan|minta|reveal|show|give|get|saya\s+(?:mau|butuh|ingin))\b.{0,220}\b(?:akun|account|username|user\s*name|password|pass(?:word)?|pw|kata\s+sandi|sandi|credential|kredensial|secret|rahasia)\b/isu.test(
+  const vaultReadIntent =
+    /^(?:(?:ya|iya),?\s+)?(?:(?:tolong|mohon|please|bisakah|bisa)(?:\s+kamu)?\s+)?(?:tampilkan|perlihatkan|berikan|kasih|kirim|buka|baca|bacakan|ungkapkan|ambilkan|minta|reveal|show|give|get|apa(?:kah)?|saya\s+(?:mau|butuh|ingin))\b.{0,240}\b(?:vault|note|catatan|isi|link|url|dashboard|akun|account|username|user\s*name|password|pass(?:word)?|pw|kata\s+sandi|sandi|credential|kredensial|secret|rahasia|informasi|data)\b/isu.test(
       intentText,
     );
-  if (memoryIntent && !vaultSaveIntent) {
+  if (memoryIntent && !vaultWriteIntent) {
     allowed.add("remember");
     allowed.add("update_memory");
   }
   if (emailWatchIntent) allowed.add("create_email_watch");
-  if (vaultSaveIntent) allowed.add("save_vault_note");
+  if (vaultWriteIntent) allowed.add("write_vault_note");
   if (vaultFolderIntent) allowed.add("create_vault_folder");
-  if (credentialRevealIntent) allowed.add("reveal_vault_note");
+  if (vaultReadIntent) allowed.add("read_vault_note");
   return allowed;
 }
 
@@ -613,11 +642,43 @@ export class PersonalAssistant {
           const results = await this.dependencies.search.search(query);
           return formatSearchResults(results, this.dependencies.search.name);
         }
-        case "save_vault_note": {
-          const args = saveVaultNoteArgsSchema.parse(parsed);
-          const parent = args.folder ? this.dependencies.vault.ensureFolderPath(args.folder) : null;
-          const item = this.dependencies.vault.saveNote(args.name, args.content, parent?.id ?? null);
-          return JSON.stringify({ saved: true, item, path: this.dependencies.vault.pathFor(item.id) });
+        case "write_vault_note": {
+          if (chatId !== String(this.config.TELEGRAM_ALLOWED_USER_ID)) {
+            return JSON.stringify({ error: "Note vault hanya dapat diubah oleh pemilik bot." });
+          }
+          const args = writeVaultNoteArgsSchema.parse(parsed);
+          if (args.operation === "create") {
+            if (args.id !== null || args.name === null) {
+              return JSON.stringify({ error: "Create memerlukan name dan id harus null." });
+            }
+            const parent = args.folder ? this.dependencies.vault.ensureFolderPath(args.folder) : null;
+            const item = this.dependencies.vault.saveNote(
+              args.name,
+              args.content,
+              parent?.id ?? null,
+            );
+            return JSON.stringify({
+              saved: true,
+              operation: "create",
+              item: { id: item.id, name: item.name, path: this.dependencies.vault.pathFor(item.id) },
+            });
+          }
+          if (args.id === null) {
+            return JSON.stringify({ error: `${args.operation} memerlukan ID note.` });
+          }
+          let item = this.dependencies.vault.updateNote(args.id, args.content, args.operation);
+          if (args.name !== null && args.name !== item.name) {
+            item = this.dependencies.vault.rename(item.id, args.name);
+          }
+          if (args.folder !== null) {
+            const parent = this.dependencies.vault.ensureFolderPath(args.folder);
+            item = this.dependencies.vault.move(item.id, parent?.id ?? null);
+          }
+          return JSON.stringify({
+            saved: true,
+            operation: args.operation,
+            item: { id: item.id, name: item.name, path: this.dependencies.vault.pathFor(item.id) },
+          });
         }
         case "create_vault_folder": {
           const { path } = createVaultFolderArgsSchema.parse(parsed);
@@ -655,25 +716,25 @@ export class PersonalAssistant {
           }
           if (item.kind !== "file") {
             return JSON.stringify({
-              error: `Item vault ${id} adalah ${item.kind}, bukan file. Gunakan reveal_vault_note untuk note bila permintaan credential telah diotorisasi.`,
+              error: `Item vault ${id} adalah ${item.kind}, bukan file. Gunakan read_vault_note untuk membaca note.`,
             });
           }
           // The Telegram adapter handles the actual send after the assistant response.
           this.emit(options, { type: "file", itemId: id });
           return JSON.stringify({ queued: true, id, name: item.name });
         }
-        case "reveal_vault_note": {
+        case "read_vault_note": {
           if (chatId !== String(this.config.TELEGRAM_ALLOWED_USER_ID)) {
             return JSON.stringify({ error: "Isi note hanya dapat dibuka oleh pemilik bot." });
           }
-          const { id } = revealVaultNoteArgsSchema.parse(parsed);
+          const { id } = readVaultNoteArgsSchema.parse(parsed);
           const item = this.dependencies.vault.get(id);
           if (!item) return JSON.stringify({ error: `Item vault ${id} tidak ditemukan.` });
           if (item.kind !== "note" || item.content === null) {
             return JSON.stringify({ error: `Item vault ${id} bukan note yang dapat ditampilkan.` });
           }
           return JSON.stringify({
-            revealed: true,
+            read: true,
             item: {
               id: item.id,
               name: item.name,

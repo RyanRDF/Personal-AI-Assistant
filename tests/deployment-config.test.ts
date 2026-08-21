@@ -16,4 +16,11 @@ describe("Railway deployment config", () => {
     expect(config.deploy.drainingSeconds).toBe(30);
     expect(typeof config.deploy.drainingSeconds).toBe("number");
   });
+
+  it("leaves persistent storage mounting to Railway Volumes", () => {
+    const dockerfile = fs.readFileSync(path.resolve("Dockerfile"), "utf8");
+
+    expect(dockerfile).not.toMatch(/^\s*VOLUME\b/imu);
+    expect(dockerfile).toContain("RUN mkdir -p /app/data");
+  });
 });

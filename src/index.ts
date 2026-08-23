@@ -93,9 +93,14 @@ async function main(): Promise<void> {
       gmail,
       emailRules,
       classifier,
-      async (message) => {
+      async (message, signal) => {
         for (const chunk of splitTelegramMessage(message)) {
-          await bot.api.sendMessage(config.TELEGRAM_ALLOWED_USER_ID, chunk);
+          await bot.api.sendMessage(
+            config.TELEGRAM_ALLOWED_USER_ID,
+            chunk,
+            undefined,
+            signal as unknown as Parameters<typeof bot.api.sendMessage>[3],
+          );
         }
       },
       logger,

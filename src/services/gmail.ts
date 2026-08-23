@@ -29,17 +29,32 @@ function stripHtml(value: string): string {
     .trim();
 }
 
-function extractText(part?: gmail_v1.Schema$MessagePart): string {
-  if (!part) return "";
-  const mimeType = part.mimeType ?? "";
-  if (mimeType === "text/plain") return decodeBody(part.body?.data);
-  if (mimeType === "text/html") return stripHtml(decodeBody(part.body?.data));
+function isAttachment(part: gmail_v1.Schema$MessagePart): boolean {
+  if (part.filename?.trim()) return true;
+  const disposition = header(part.headers, "Content-Disposition");
+  return /^\s*attachment(?:\s*;|\s*$)/i.test(disposition);
+}
 
-  const children = part.parts ?? [];
-  const plain = children.find((child) => child.mimeType === "text/plain");
-  if (plain) return decodeBody(plain.body?.data);
-  const nested = children.map(extractText).filter(Boolean);
-  return nested.join("\n\n");
+function collectTextParts(
+  part: gmail_v1.Schema$MessagePart | undefined,
+  mimeType: "text/plain" | "text/html",
+): string[] {
+  if (!part || isAttachment(part)) return [];
+
+  const currentMimeType = part.mimeType?.toLowerCase();
+  if (currentMimeType === mimeType) {
+    const decoded = decodeBody(part.body?.data);
+    const text = mimeType === "text/html" ? stripHtml(decoded) : decoded.trim();
+    return text ? [text] : [];
+  }
+
+  return (part.parts ?? []).flatMap((child) => collectTextParts(child, mimeType));
+}
+
+export function extractText(part?: gmail_v1.Schema$MessagePart): string {
+  const plain = collectTextParts(part, "text/plain");
+  if (plain.length > 0) return plain.join("\n\n");
+  return collectTextParts(part, "text/html").join("\n\n");
 }
 
 function header(
@@ -52,6 +67,14 @@ function header(
 export interface GmailHistoryBatch {
   messageIds: string[];
   latestHistoryId: string;
+}
+
+export interface GmailRequestOptions {
+  signal?: AbortSignal;
+}
+
+function requestOptions(options?: GmailRequestOptions): { signal: AbortSignal } | undefined {
+  return options?.signal ? { signal: options.signal } : undefined;
 }
 
 export class GmailService {
@@ -70,25 +93,34 @@ export class GmailService {
     this.client = google.gmail({ version: "v1", auth });
   }
 
-  async getCurrentHistoryId(): Promise<string> {
-    const profile = await this.client.users.getProfile({ userId: "me" });
+  async getCurrentHistoryId(options?: GmailRequestOptions): Promise<string> {
+    const profile = await this.client.users.getProfile(
+      { userId: "me" },
+      requestOptions(options),
+    );
     if (!profile.data.historyId) throw new Error("Gmail tidak mengembalikan historyId.");
     return profile.data.historyId;
   }
 
-  async listNewMessageIds(startHistoryId: string): Promise<GmailHistoryBatch> {
+  async listNewMessageIds(
+    startHistoryId: string,
+    options?: GmailRequestOptions,
+  ): Promise<GmailHistoryBatch> {
     const ids = new Set<string>();
     let pageToken: string | undefined;
     let latestHistoryId = startHistoryId;
 
     do {
-      const response = await this.client.users.history.list({
-        userId: "me",
-        startHistoryId,
-        historyTypes: ["messageAdded"],
-        maxResults: 100,
-        ...(pageToken ? { pageToken } : {}),
-      });
+      const response = await this.client.users.history.list(
+        {
+          userId: "me",
+          startHistoryId,
+          historyTypes: ["messageAdded"],
+          maxResults: 100,
+          ...(pageToken ? { pageToken } : {}),
+        },
+        requestOptions(options),
+      );
       latestHistoryId = response.data.historyId ?? latestHistoryId;
       for (const history of response.data.history ?? []) {
         for (const added of history.messagesAdded ?? []) {
@@ -103,12 +135,15 @@ export class GmailService {
     return { messageIds: [...ids], latestHistoryId };
   }
 
-  async getMessage(id: string): Promise<GmailMessage> {
-    const response = await this.client.users.messages.get({
-      userId: "me",
-      id,
-      format: "full",
-    });
+  async getMessage(id: string, options?: GmailRequestOptions): Promise<GmailMessage> {
+    const response = await this.client.users.messages.get(
+      {
+        userId: "me",
+        id,
+        format: "full",
+      },
+      requestOptions(options),
+    );
     const message = response.data;
     const headers = message.payload?.headers;
     const body = extractText(message.payload).slice(0, this.config.GMAIL_MAX_BODY_CHARS);
@@ -124,20 +159,44 @@ export class GmailService {
     };
   }
 
-  async search(query: string, limit = 10): Promise<GmailMessage[]> {
-    const ids = await this.searchMessageIds(query, limit);
-    return Promise.all(ids.map((id) => this.getMessage(id)));
+  async search(
+    query: string,
+    limit = 10,
+    options?: GmailRequestOptions,
+  ): Promise<GmailMessage[]> {
+    const ids = await this.searchMessageIds(query, limit, options);
+    return Promise.all(ids.map((id) => this.getMessage(id, options)));
   }
 
-  async searchMessageIds(query: string, limit = 100): Promise<string[]> {
-    const response = await this.client.users.messages.list({
-      userId: "me",
-      q: query,
-      maxResults: Math.min(limit, 100),
-    });
-    return (response.data.messages ?? []).flatMap((message) =>
-      message.id ? [message.id] : [],
-    );
+  async searchMessageIds(
+    query: string,
+    limit = 100,
+    options?: GmailRequestOptions,
+  ): Promise<string[]> {
+    if (!Number.isFinite(limit) && limit !== Number.POSITIVE_INFINITY) return [];
+    if (limit <= 0) return [];
+
+    const ids = new Set<string>();
+    let pageToken: string | undefined;
+    do {
+      const remaining = Number.isFinite(limit) ? limit - ids.size : 100;
+      const response = await this.client.users.messages.list(
+        {
+          userId: "me",
+          q: query,
+          maxResults: Math.min(Math.max(remaining, 1), 100),
+          ...(pageToken ? { pageToken } : {}),
+        },
+        requestOptions(options),
+      );
+      for (const message of response.data.messages ?? []) {
+        if (message.id) ids.add(message.id);
+        if (ids.size >= limit) break;
+      }
+      pageToken = ids.size < limit ? response.data.nextPageToken ?? undefined : undefined;
+    } while (pageToken);
+
+    return [...ids];
   }
 }
 

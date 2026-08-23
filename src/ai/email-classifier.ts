@@ -21,27 +21,40 @@ export class EmailClassifier {
     private readonly database: Database.Database,
   ) {}
 
-  async classify(rule: EmailRule, message: GmailMessage): Promise<EmailMatchResult> {
-    const completion = await this.client.chat.completions.create({
-      model: this.config.OPENAI_CLASSIFIER_MODEL,
-      messages: [
-        { role: "system", content: EMAIL_CLASSIFIER_SYSTEM_PROMPT },
-        {
-          role: "user",
-          content: [
-            `Aturan pengguna:\n${rule.description}`,
-            rule.gmailQuery
-              ? `Hint filter Gmail (petunjuk tambahan, bukan hard-negative): ${rule.gmailQuery}`
-              : "",
-            gmailMessageForModel(message),
-          ]
-            .filter(Boolean)
-            .join("\n\n"),
-        },
-      ],
-      response_format: { type: "json_object" },
-      max_completion_tokens: 400,
-    });
+  async classify(
+    rule: EmailRule,
+    message: GmailMessage,
+    callerSignal?: AbortSignal,
+  ): Promise<EmailMatchResult> {
+    const timeoutSignal = AbortSignal.timeout(
+      this.config.EMAIL_CLASSIFIER_TIMEOUT_SECONDS * 1000,
+    );
+    const signal = callerSignal
+      ? AbortSignal.any([callerSignal, timeoutSignal])
+      : timeoutSignal;
+    const completion = await this.client.chat.completions.create(
+      {
+        model: this.config.OPENAI_CLASSIFIER_MODEL,
+        messages: [
+          { role: "system", content: EMAIL_CLASSIFIER_SYSTEM_PROMPT },
+          {
+            role: "user",
+            content: [
+              `Aturan pengguna:\n${rule.description}`,
+              rule.gmailQuery
+                ? `Hint filter Gmail (petunjuk tambahan, bukan hard-negative): ${rule.gmailQuery}`
+                : "",
+              gmailMessageForModel(message),
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
+          },
+        ],
+        response_format: { type: "json_object" },
+        max_completion_tokens: 400,
+      },
+      { signal },
+    );
     recordUsage(
       this.database,
       "email-classification",

@@ -22,6 +22,10 @@ import {
 } from "../services/request-trace.js";
 import type { TelegramHistoryService } from "../services/telegram-history.js";
 import type { WebSearchProvider } from "../services/web-search.js";
+import {
+  PendingImageCoordinator,
+  type PendingImageSource,
+} from "./pending-images.js";
 
 const HELP_TEXT = `Asisten personal siap digunakan.
 
@@ -92,20 +96,33 @@ interface ActiveRequest {
   resolveFinished: () => void;
 }
 
-interface PendingImage {
-  image: AssistantImageInput;
-  expiresAt: number;
-}
-
-interface PendingImageDownload {
-  promise: Promise<AssistantImageInput>;
-  controller: AbortController;
-  claimed: boolean;
-}
-
 interface ProgressController {
   update(text: string, force?: boolean): void;
-  finish(text: string): Promise<void>;
+  finish(text: string, allowAfterAbort?: boolean): Promise<void>;
+}
+
+interface TelegramCallOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  canPublish?: () => boolean;
+}
+
+type GrammyAbortSignal = NonNullable<Parameters<Context["reply"]>[2]>;
+
+function asGrammySignal(signal: AbortSignal): GrammyAbortSignal {
+  // grammY currently exposes the abort-controller package's structural type,
+  // while Node supplies the runtime-compatible native AbortSignal.
+  return signal as unknown as GrammyAbortSignal;
+}
+
+const TELEGRAM_API_TIMEOUT_MS = 10_000;
+const TELEGRAM_TERMINAL_API_TIMEOUT_MS = 5_000;
+
+class TelegramCallAbortedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TelegramCallAbortedError";
+  }
 }
 
 class ImageInputError extends Error {}
@@ -158,6 +175,95 @@ function splitTelegramMessage(text: string, maxLength = 4000): string[] {
   return chunks;
 }
 
+export async function replyInTelegramChunks(ctx: Context, text: string): Promise<void> {
+  for (const chunk of splitTelegramMessage(text)) await ctx.reply(chunk);
+}
+
+function callAbortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new TelegramCallAbortedError("Telegram call aborted");
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(callAbortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(callAbortReason(signal));
+    signal.addEventListener("abort", abort, { once: true });
+    void promise
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+async function awaitTelegramCall<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  options: TelegramCallOptions = {},
+): Promise<T> {
+  const canPublish = options.canPublish ?? (() => true);
+  if (!canPublish()) throw new TelegramCallAbortedError("Telegram publication is stale");
+  if (options.signal?.aborted) throw callAbortReason(options.signal);
+
+  const timeoutMs = options.timeoutMs ?? TELEGRAM_API_TIMEOUT_MS;
+  const callController = new AbortController();
+  const forwardAbort = () => callController.abort(callAbortReason(options.signal!));
+  options.signal?.addEventListener("abort", forwardAbort, { once: true });
+  const timer = setTimeout(
+    () => callController.abort(new TelegramCallAbortedError("Telegram call timed out")),
+    timeoutMs,
+  );
+  timer.unref();
+
+  let promise: Promise<T>;
+  try {
+    promise = operation(callController.signal);
+  } catch (error) {
+    clearTimeout(timer);
+    options.signal?.removeEventListener("abort", forwardAbort);
+    throw error;
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", forwardAbort);
+      callController.signal.removeEventListener("abort", abort);
+      callback();
+    };
+    const abort = () => finish(() => reject(callAbortReason(callController.signal)));
+    callController.signal.addEventListener("abort", abort, { once: true });
+    void promise.then(
+      (value) => finish(() => (canPublish() ? resolve(value) : reject(new TelegramCallAbortedError("Telegram publication is stale")))),
+      (error: unknown) => finish(() => reject(error)),
+    );
+  });
+}
+
+export async function editMessageOrReply(
+  ctx: Context,
+  messageId: number,
+  text: string,
+  logger: AppLogger,
+  options: TelegramCallOptions = {},
+): Promise<void> {
+  try {
+    await awaitTelegramCall(
+      (signal) =>
+        ctx.api.editMessageText(ctx.chat!.id, messageId, text, {}, asGrammySignal(signal)),
+      options,
+    );
+  } catch (error) {
+    if (error instanceof TelegramCallAbortedError || options.signal?.aborted) throw error;
+    const message = safeErrorMessage(error);
+    if (message.includes("message is not modified")) return;
+    logger.debug({ errorMessage: message }, "Telegram message edit failed; replying instead");
+    await awaitTelegramCall(
+      (signal) => ctx.reply(text, {}, asGrammySignal(signal)),
+      options,
+    );
+  }
+}
+
 function commandId(text: string | undefined): number | null {
   if (!text) return null;
   const raw = text.trim().split(/\s+/)[1];
@@ -201,7 +307,7 @@ async function downloadTelegramFile(
       `Ukuran file melebihi batas vault ${formatByteLimit(config.VAULT_MAX_FILE_BYTES)}.`,
     );
   }
-  const file = await ctx.api.getFile(fileId);
+  const file = await ctx.api.getFile(fileId, signal ? asGrammySignal(signal) : undefined);
   if (!file.file_path) throw new InvalidVaultOperationError("Lokasi file Telegram tidak tersedia.");
   if (file.file_size && file.file_size > config.VAULT_MAX_FILE_BYTES) {
     throw new InvalidVaultOperationError(
@@ -282,7 +388,7 @@ async function downloadTelegramImage(
       `Ukuran gambar melebihi batas ${formatByteLimit(config.TELEGRAM_IMAGE_MAX_BYTES)}.`,
     );
   }
-  const file = await ctx.api.getFile(fileId);
+  const file = await ctx.api.getFile(fileId, asGrammySignal(signal));
   if (!file.file_path) throw new ImageInputError("Telegram tidak memberikan lokasi file gambar.");
   if (file.file_size && file.file_size > config.TELEGRAM_IMAGE_MAX_BYTES) {
     throw new ImageInputError(
@@ -322,11 +428,12 @@ async function downloadTelegramImage(
   };
 }
 
-function createProgressController(
+export function createProgressController(
   ctx: Context,
   messageId: number,
   minimumUpdateMs: number,
   logger: AppLogger,
+  options: TelegramCallOptions = {},
 ): ProgressController {
   let closed = false;
   let lastQueuedAt = 0;
@@ -338,8 +445,13 @@ function createProgressController(
     lastQueuedAt = Date.now();
     editQueue = editQueue.then(async () => {
       try {
-        await ctx.api.editMessageText(ctx.chat!.id, messageId, text);
+        await awaitTelegramCall(
+          (signal) =>
+            ctx.api.editMessageText(ctx.chat!.id, messageId, text, {}, asGrammySignal(signal)),
+          options,
+        );
       } catch (error) {
+        if (error instanceof TelegramCallAbortedError || options.signal?.aborted) return;
         const message = safeErrorMessage(error);
         if (!message.includes("message is not modified")) {
           logger.debug({ errorMessage: message }, "Telegram progress edit failed");
@@ -369,21 +481,20 @@ function createProgressController(
         timer = setTimeout(flush, remainingDelay);
       }
     },
-    async finish(text) {
-      if (closed) return;
+    async finish(text, allowAfterAbort = false) {
+      if (closed && !allowAfterAbort) return;
       closed = true;
       if (timer) clearTimeout(timer);
       timer = null;
       pendingText = null;
       await editQueue;
-      try {
-        await ctx.api.editMessageText(ctx.chat!.id, messageId, text);
-      } catch (error) {
-        const message = safeErrorMessage(error);
-        if (!message.includes("message is not modified")) {
-          logger.debug({ errorMessage: message }, "Telegram final progress edit failed");
-        }
-      }
+      const finishOptions: TelegramCallOptions = allowAfterAbort
+        ? {
+            timeoutMs: TELEGRAM_TERMINAL_API_TIMEOUT_MS,
+            ...(options.canPublish ? { canPublish: options.canPublish } : {}),
+          }
+        : options;
+      await editMessageOrReply(ctx, messageId, text, logger, finishOptions);
     },
   };
 }
@@ -404,15 +515,6 @@ function isAbortError(error: unknown, signal: AbortSignal): boolean {
   );
 }
 
-async function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw signal.reason;
-  return new Promise<T>((resolve, reject) => {
-    const abort = () => reject(signal.reason);
-    signal.addEventListener("abort", abort, { once: true });
-    void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
-  });
-}
-
 export function isOwnerPrivateChat(
   allowedUserId: number,
   fromId: number | undefined,
@@ -428,8 +530,7 @@ export function createTelegramBot(
 ): Bot {
   const bot = new Bot(config.TELEGRAM_BOT_TOKEN);
   const activeRequests = new Map<string, ActiveRequest>();
-  const pendingImages = new Map<string, PendingImage>();
-  const pendingImageDownloads = new Map<string, PendingImageDownload>();
+  const pendingImages = new PendingImageCoordinator<AssistantImageInput>();
 
   bot.api.config.use(async (previous, method, payload, signal) => {
     const response = await previous(method, payload, signal);
@@ -454,16 +555,8 @@ export function createTelegramBot(
 
   function takePendingImage(
     chatId: string,
-  ): AssistantImageInput | ((signal: AbortSignal) => Promise<AssistantImageInput>) | null {
-    const downloading = pendingImageDownloads.get(chatId);
-    if (downloading && !downloading.claimed) {
-      downloading.claimed = true;
-      return (signal) => awaitWithSignal(downloading.promise, signal);
-    }
-    const pending = pendingImages.get(chatId);
-    if (!pending) return null;
-    pendingImages.delete(chatId);
-    return pending.expiresAt > Date.now() ? pending.image : null;
+  ): PendingImageSource<AssistantImageInput> | null {
+    return pendingImages.take(chatId);
   }
 
   async function replyIfBusy(ctx: Context): Promise<boolean> {
@@ -477,15 +570,27 @@ export function createTelegramBot(
     return true;
   }
 
-  async function sendVaultFile(ctx: Context, itemId: number): Promise<void> {
+  async function sendVaultFile(
+    ctx: Context,
+    itemId: number,
+    callOptions: TelegramCallOptions = {},
+  ): Promise<void> {
     const item = dependencies.vault.get(itemId);
     if (!item || item.kind !== "file") {
-      await ctx.reply(`File vault ${itemId} tidak ditemukan.`);
+      await awaitTelegramCall(
+        (signal) =>
+          ctx.reply(`File vault ${itemId} tidak ditemukan.`, {}, asGrammySignal(signal)),
+        callOptions,
+      );
       return;
     }
-    await ctx.replyWithDocument(new InputFile(dependencies.vault.filePath(item.id), item.name), {
-      caption: `📎 ${dependencies.vault.pathFor(item.id)} · ${formatBytes(item.sizeBytes)}`,
-    });
+    await awaitTelegramCall(
+      (signal) =>
+        ctx.replyWithDocument(new InputFile(dependencies.vault.filePath(item.id), item.name), {
+          caption: `📎 ${dependencies.vault.pathFor(item.id)} · ${formatBytes(item.sizeBytes)}`,
+        }, asGrammySignal(signal)),
+      callOptions,
+    );
   }
 
   async function saveTelegramFile(
@@ -498,7 +603,10 @@ export function createTelegramBot(
       folderPath?: string;
     },
   ): Promise<void> {
-    const status = await ctx.reply("📥 Menyimpan file ke vault…");
+    const status = await awaitTelegramCall((signal) =>
+      ctx.reply("📥 Menyimpan file ke vault…", {}, asGrammySignal(signal)),
+    );
+    let acknowledgement: string;
     try {
       const parent = input.folderPath
         ? dependencies.vault.ensureFolderPath(input.folderPath)
@@ -517,11 +625,7 @@ export function createTelegramBot(
         chatId: String(ctx.chat!.id),
         messageId: String(ctx.message?.message_id ?? ""),
       });
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        status.message_id,
-        `✅ File disimpan: ${dependencies.vault.pathFor(item.id)} (#${item.id}, ${formatBytes(item.sizeBytes)})`,
-      );
+      acknowledgement = `✅ File disimpan: ${dependencies.vault.pathFor(item.id)} (#${item.id}, ${formatBytes(item.sizeBytes)})`;
     } catch (error) {
       const message =
         error instanceof DuplicateVaultItemError
@@ -529,7 +633,15 @@ export function createTelegramBot(
           : error instanceof Error
             ? error.message
             : "File gagal disimpan.";
-      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, `⚠️ ${message}`);
+      acknowledgement = `⚠️ ${message}`;
+    }
+    try {
+      await editMessageOrReply(ctx, status.message_id, acknowledgement, logger);
+    } catch (error) {
+      logger.warn(
+        { errorMessage: safeErrorMessage(error) },
+        "Telegram file-save acknowledgement failed",
+      );
     }
   }
 
@@ -569,20 +681,43 @@ export function createTelegramBot(
     let progress: ProgressController | null = null;
     let typingTimer: NodeJS.Timeout | null = null;
     const requestedFileIds = new Set<number>();
+    const activeCallOptions: TelegramCallOptions = {
+      signal: active.controller.signal,
+      canPublish: () => activeRequests.get(chatId) === active,
+    };
 
     try {
-      const initialMessage = await ctx.reply(
-        inputKind === "image" ? "📷 Gambar diterima. Menyiapkan analisis…" : "⏳ Memproses permintaan…",
+      const initialMessage = await awaitTelegramCall(
+        (signal) =>
+          ctx.reply(
+            inputKind === "image"
+              ? "📷 Gambar diterima. Menyiapkan analisis…"
+              : "⏳ Memproses permintaan…",
+            {},
+            asGrammySignal(signal),
+          ),
+        activeCallOptions,
       );
       progress = createProgressController(
         ctx,
         initialMessage.message_id,
         config.TELEGRAM_PROGRESS_UPDATE_MS,
         logger,
+        activeCallOptions,
       );
       const sendTyping = () => {
-        void ctx.replyWithChatAction("typing").catch((error: unknown) =>
-          logger.debug({ errorMessage: safeErrorMessage(error) }, "Telegram typing action failed"),
+        void awaitTelegramCall(
+          (signal) => ctx.replyWithChatAction("typing", {}, asGrammySignal(signal)),
+          activeCallOptions,
+        ).catch(
+          (error: unknown) => {
+            if (!active.controller.signal.aborted) {
+              logger.debug(
+                { errorMessage: safeErrorMessage(error) },
+                "Telegram typing action failed",
+              );
+            }
+          },
         );
       };
       sendTyping();
@@ -596,7 +731,10 @@ export function createTelegramBot(
           liveTrace ? traceProgressText(trace, "Mengunduh gambar Telegram") : "📥 Mengunduh gambar…",
           true,
         );
-        image = await imageSource(active.controller.signal);
+        image = await awaitWithSignal(
+          imageSource(active.controller.signal),
+          active.controller.signal,
+        );
         dependencies.traces.addStage(trace.requestId, "image_ready", "Gambar siap dianalisis");
       } else if (imageSource) {
         image = imageSource;
@@ -642,28 +780,44 @@ export function createTelegramBot(
       const chunks = splitTelegramMessage(answer);
       if (liveTrace) {
         await progress.finish(`✅ Selesai\n\n${formatRequestTrace(completedTrace)}`);
-        for (const chunk of chunks) await ctx.reply(chunk);
+        for (const chunk of chunks) {
+          await awaitTelegramCall(
+            (signal) => ctx.reply(chunk, {}, asGrammySignal(signal)),
+            activeCallOptions,
+          );
+        }
       } else {
         await progress.finish(chunks[0] ?? "Selesai.");
-        for (const chunk of chunks.slice(1)) await ctx.reply(chunk);
+        for (const chunk of chunks.slice(1)) {
+          await awaitTelegramCall(
+            (signal) => ctx.reply(chunk, {}, asGrammySignal(signal)),
+            activeCallOptions,
+          );
+        }
       }
-      for (const itemId of requestedFileIds) await sendVaultFile(ctx, itemId);
+      for (const itemId of requestedFileIds) {
+        await sendVaultFile(ctx, itemId, activeCallOptions);
+      }
     } catch (error) {
       const aborted = isAbortError(error, active.controller.signal);
       const status = active.timedOut ? "timeout" : aborted ? "cancelled" : "failed";
       const safeMessage = safeErrorMessage(error);
       dependencies.traces.finish(trace.requestId, status, safeMessage);
       if (status === "cancelled") {
-        await progress?.finish("⛔ Permintaan dibatalkan.");
+        await progress?.finish("⛔ Permintaan dibatalkan.", true);
       } else if (status === "timeout") {
         await progress?.finish(
           `⌛ Proses melewati batas ${config.ASSISTANT_TIMEOUT_SECONDS} detik. Silakan coba lagi.`,
+          true,
         );
       } else if (error instanceof ImageInputError) {
-        await progress?.finish(`⚠️ ${error.message}`);
+        await progress?.finish(`⚠️ ${error.message}`, true);
       } else {
         logger.error({ errorMessage: safeMessage }, "Assistant response failed");
-        await progress?.finish("Maaf, terjadi kesalahan saat memproses permintaan. Coba lagi sebentar.");
+        await progress?.finish(
+          "Maaf, terjadi kesalahan saat memproses permintaan. Coba lagi sebentar.",
+          true,
+        );
       }
     } finally {
       clearTimeout(timeout);
@@ -680,8 +834,17 @@ export function createTelegramBot(
     knownFileSize: number | undefined,
     caption: string | undefined,
   ): Promise<void> {
-    if (await replyIfBusy(ctx)) return;
     const chatId = String(ctx.chat!.id);
+    // Do not await the negative busy check: another update (/cancel or text) may
+    // otherwise interleave before the image has a coordinator identity.
+    const active = activeRequests.get(chatId);
+    if (active) {
+      await ctx.reply(
+        `Masih memproses permintaan #${active.requestId.slice(0, 8).toUpperCase()}. ` +
+          "Kirim /cancel untuk membatalkannya.",
+      );
+      return;
+    }
     const trimmedCaption = caption?.trim();
     const loader = (signal: AbortSignal) =>
       downloadTelegramImage(
@@ -697,60 +860,58 @@ export function createTelegramBot(
       return;
     }
 
-    const downloadController = new AbortController();
-    const downloadTimeout = setTimeout(() => {
-      downloadController.abort(new Error("Telegram image download timed out"));
-    }, 30_000);
-    const pendingDownload: PendingImageDownload = {
-      promise: loader(downloadController.signal),
-      controller: downloadController,
-      claimed: false,
-    };
-    pendingImageDownloads.set(chatId, pendingDownload);
-    // The explicit rejection handler prevents an unhandled promise if Telegram cannot
-    // create the status message while the file request is already in flight.
-    void pendingDownload.promise.catch(() => undefined);
-    const statusMessage = await ctx.reply("📥 Mengunduh gambar…").catch((error: unknown) => {
-      clearTimeout(downloadTimeout);
-      downloadController.abort(new Error("Telegram status message failed"));
-      if (pendingImageDownloads.get(chatId) === pendingDownload) {
-        pendingImageDownloads.delete(chatId);
-      }
-      throw error;
-    });
+    const pendingOperation = pendingImages.begin(
+      chatId,
+      loader,
+      30_000,
+      config.TELEGRAM_PENDING_IMAGE_SECONDS * 1000,
+    );
+    let statusMessage: Awaited<ReturnType<Context["reply"]>>;
     try {
-      const image = await pendingDownload.promise;
-      if (!pendingDownload.claimed) {
-        pendingImages.set(chatId, {
-          image,
-          expiresAt: Date.now() + config.TELEGRAM_PENDING_IMAGE_SECONDS * 1000,
-        });
-      }
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        statusMessage.message_id,
-        pendingDownload.claimed
-          ? "📷 Gambar diterima dan sedang dipakai untuk menjawab pertanyaan Anda."
-          : `📷 Gambar diterima. Kirim pertanyaan dalam ${Math.floor(
-              config.TELEGRAM_PENDING_IMAGE_SECONDS / 60,
-            )} menit. Gambar hanya disimpan sementara di memori.`,
+      statusMessage = await awaitTelegramCall(
+        (signal) => ctx.reply("📥 Mengunduh gambar…", {}, asGrammySignal(signal)),
+        { canPublish: pendingOperation.canPublish },
       );
     } catch (error) {
-      const message =
-        downloadController.signal.aborted
+      // Conditional token cleanup cannot cancel an image that a newer update
+      // installed while this status request was in flight.
+      pendingOperation.cancel(new Error("Telegram status message failed"));
+      if (!pendingOperation.canPublish() || error instanceof TelegramCallAbortedError) return;
+      throw error;
+    }
+    let acknowledgement: string;
+    try {
+      await pendingOperation.promise;
+      acknowledgement = pendingOperation.wasClaimed()
+        ? "📷 Gambar diterima dan sedang dipakai untuk menjawab pertanyaan Anda."
+        : `📷 Gambar diterima. Kirim pertanyaan dalam ${Math.floor(
+            config.TELEGRAM_PENDING_IMAGE_SECONDS / 60,
+          )} menit. Gambar hanya disimpan sementara di memori.`;
+    } catch (error) {
+      acknowledgement =
+        pendingOperation.wasAborted()
           ? "⛔ Pengunduhan gambar dibatalkan."
           : error instanceof ImageInputError
           ? `⚠️ ${error.message}`
           : "Maaf, gambar gagal diunduh. Silakan kirim ulang.";
-      await ctx.api.editMessageText(ctx.chat!.id, statusMessage.message_id, message);
-      if (!downloadController.signal.aborted && !(error instanceof ImageInputError)) {
+      if (!pendingOperation.wasAborted() && !(error instanceof ImageInputError)) {
         logger.error({ errorMessage: safeErrorMessage(error) }, "Telegram image download failed");
       }
-    } finally {
-      clearTimeout(downloadTimeout);
-      if (pendingImageDownloads.get(chatId) === pendingDownload) {
-        pendingImageDownloads.delete(chatId);
-      }
+    }
+    if (!pendingOperation.canPublish()) return;
+    try {
+      await editMessageOrReply(
+        ctx,
+        statusMessage.message_id,
+        acknowledgement,
+        logger,
+        { canPublish: pendingOperation.canPublish },
+      );
+    } catch (error) {
+      logger.warn(
+        { errorMessage: safeErrorMessage(error) },
+        "Telegram image acknowledgement failed",
+      );
     }
   }
 
@@ -797,7 +958,7 @@ export function createTelegramBot(
     const text = memories
       .map((memory) => `${memory.id}. [${memory.kind}] ${memory.content}`)
       .join("\n");
-    await ctx.reply(`Memori tersimpan:\n${text}`);
+    await replyInTelegramChunks(ctx, `Memori tersimpan:\n${text}`);
   });
 
   bot.command("forget", async (ctx) => {
@@ -839,7 +1000,10 @@ export function createTelegramBot(
       const size = item.kind === "folder" ? "" : ` · ${formatBytes(item.sizeBytes)}`;
       return `${icon} #${item.id} ${item.name}${size}`;
     });
-    await ctx.reply(`Isi vault ${requestedPath ? `/${requestedPath}` : "/"}:\n${lines.join("\n")}`);
+    await replyInTelegramChunks(
+      ctx,
+      `Isi vault ${requestedPath ? `/${requestedPath}` : "/"}:\n${lines.join("\n")}`,
+    );
   });
 
   bot.command("mkdir", async (ctx) => {
@@ -937,7 +1101,8 @@ export function createTelegramBot(
       await ctx.reply(`Tidak ada item vault yang cocok dengan \"${query}\".`);
       return;
     }
-    await ctx.reply(
+    await replyInTelegramChunks(
+      ctx,
       items
         .map((item) => `${item.kind === "folder" ? "📁" : item.kind === "note" ? "📝" : "📄"} #${item.id} ${dependencies.vault.pathFor(item.id)}`)
         .join("\n"),
@@ -1019,7 +1184,7 @@ export function createTelegramBot(
           }`,
       )
       .join("\n");
-    await ctx.reply(`Aturan email:\n${text}`);
+    await replyInTelegramChunks(ctx, `Aturan email:\n${text}`);
   });
 
   bot.command("delete_watch", async (ctx) => {
@@ -1068,11 +1233,7 @@ export function createTelegramBot(
     }
 
     const deleted = dependencies.conversations.clear(chatId);
-    pendingImages.delete(chatId);
-    pendingImageDownloads.get(chatId)?.controller.abort(
-      new Error("Cleared by Telegram owner"),
-    );
-    pendingImageDownloads.delete(chatId);
+    pendingImages.cancel(chatId, new Error("Cleared by Telegram owner"));
 
     // Stay clear of Telegram's exact 48-hour boundary to avoid clock-skew failures.
     const cutoff = Math.floor(Date.now() / 1000) - TELEGRAM_DELETE_WINDOW_SECONDS + 60;
@@ -1134,12 +1295,12 @@ export function createTelegramBot(
   bot.command("cancel", async (ctx) => {
     const chatId = String(ctx.chat.id);
     const active = activeRequests.get(chatId);
-    const hadPendingImage = pendingImages.delete(chatId);
-    const pendingDownload = pendingImageDownloads.get(chatId);
-    pendingDownload?.controller.abort(new Error("Cancelled by Telegram owner"));
-    const hadPendingDownload = pendingImageDownloads.delete(chatId);
+    const hadPendingImage = pendingImages.cancel(
+      chatId,
+      new Error("Cancelled by Telegram owner"),
+    );
     if (active) active.controller.abort(new Error("Cancelled by Telegram owner"));
-    if (active || hadPendingImage || hadPendingDownload) {
+    if (active || hadPendingImage) {
       await ctx.reply(
         active
           ? `Pembatalan dikirim untuk permintaan #${active.requestId.slice(0, 8).toUpperCase()}.`

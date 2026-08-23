@@ -52,6 +52,7 @@ const envSchema = z.object({
   GMAIL_MATCH_THRESHOLD: z.coerce.number().min(0).max(1).default(0.72),
   GMAIL_MAX_BODY_CHARS: z.coerce.number().int().min(500).max(30_000).default(6000),
   EMAIL_MAX_RETRIES: z.coerce.number().int().min(1).max(20).default(3),
+  EMAIL_CLASSIFIER_TIMEOUT_SECONDS: z.coerce.number().int().min(1).max(600).default(30),
   SEARCH_PROVIDER: z.enum(["brave", "searxng"]).default("searxng"),
   BRAVE_SEARCH_API_KEY: optionalTrimmedString,
   SEARXNG_BASE_URL: z.string().url().default("http://localhost:8080"),

@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   DuplicateVaultItemError,
@@ -28,6 +30,24 @@ describe("vault storage", () => {
     );
   });
 
+  it("prevalidates and rolls back every folder in an invalid nested path", () => {
+    expect(() => vault.ensureFolderPath(`Baru/${"x".repeat(181)}`)).toThrow(
+      InvalidVaultOperationError,
+    );
+    expect(vault.resolveFolderPath("Baru")).toBeNull();
+
+    setup.database.exec(`
+      CREATE TRIGGER fail_nested_folder_insert
+      BEFORE INSERT ON vault_items WHEN NEW.kind = 'folder' AND NEW.name = 'Gagal'
+      BEGIN SELECT RAISE(ABORT, 'simulated nested failure'); END;
+    `);
+    expect(() => vault.ensureFolderPath("Sementara/Gagal")).toThrow(
+      "simulated nested failure",
+    );
+    setup.database.exec("DROP TRIGGER fail_nested_folder_insert");
+    expect(vault.resolveFolderPath("Sementara")).toBeNull();
+  });
+
   it("persists and returns file bytes", () => {
     const file = vault.saveFile({
       name: "invoice.pdf",
@@ -37,6 +57,27 @@ describe("vault storage", () => {
     expect(file.sha256).toHaveLength(64);
     expect(fs.readFileSync(vault.filePath(file.id))).toEqual(Buffer.from([1, 2, 3, 4]));
     expect(vault.stats()).toEqual({ folders: 0, files: 1, notes: 0, totalBytes: 4 });
+  });
+
+  it("removes staging and metadata when a file insert fails", () => {
+    setup.database.exec(`
+      CREATE TRIGGER fail_vault_file_insert
+      BEFORE INSERT ON vault_items WHEN NEW.kind = 'file'
+      BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END;
+    `);
+
+    expect(() => vault.saveFile({ name: "gagal.txt", bytes: Buffer.from("gagal") })).toThrow(
+      "simulated insert failure",
+    );
+
+    setup.database.exec("DROP TRIGGER fail_vault_file_insert");
+    expect(vault.stats().files).toBe(0);
+    expect(fs.readdirSync(path.join(vault.storagePath, ".tmp"))).toEqual([]);
+    expect(
+      (setup.database.prepare("SELECT count(*) AS count FROM vault_fs_operations").get() as {
+        count: number;
+      }).count,
+    ).toBe(0);
   });
 
   it("searches note content and prevents folder cycles", () => {
@@ -73,5 +114,95 @@ describe("vault storage", () => {
     expect(vault.delete(folder.id)).toBe(2);
     expect(vault.get(file.id)).toBeNull();
     expect(fs.existsSync(storedPath)).toBe(false);
+  });
+
+  it("restores trashed bytes when metadata deletion fails", () => {
+    const file = vault.saveFile({ name: "tetap.txt", bytes: Buffer.from("tetap") });
+    const storedPath = vault.filePath(file.id);
+    setup.database.exec(`
+      CREATE TRIGGER fail_vault_delete
+      BEFORE DELETE ON vault_items
+      BEGIN SELECT RAISE(ABORT, 'simulated delete failure'); END;
+    `);
+
+    expect(() => vault.delete(file.id)).toThrow("simulated delete failure");
+
+    setup.database.exec("DROP TRIGGER fail_vault_delete");
+    expect(vault.get(file.id)).not.toBeNull();
+    expect(fs.readFileSync(storedPath, "utf8")).toBe("tetap");
+    expect(fs.readdirSync(path.join(vault.storagePath, ".trash"))).toEqual([]);
+    expect(
+      (setup.database.prepare("SELECT count(*) AS count FROM vault_fs_operations").get() as {
+        count: number;
+      }).count,
+    ).toBe(0);
+  });
+
+  it("reconciles interrupted save and delete operations on startup", () => {
+    const saveStorageKey = randomUUID();
+    const saveOperationId = randomUUID();
+    fs.writeFileSync(
+      path.join(vault.storagePath, ".tmp", saveOperationId),
+      Buffer.from("dipulihkan"),
+    );
+    const saveItemId = Number(
+      setup.database
+        .prepare(
+          `INSERT INTO vault_items(kind, name, mime_type, size_bytes, storage_key, sha256)
+           VALUES ('file', 'pulih.txt', 'text/plain', 10, ?, ?)`,
+        )
+        .run(saveStorageKey, "0".repeat(64)).lastInsertRowid,
+    );
+    setup.database
+      .prepare(
+        "INSERT INTO vault_fs_operations(id, operation, storage_key) VALUES (?, 'save', ?)",
+      )
+      .run(saveOperationId, saveStorageKey);
+
+    const deleteItem = vault.saveFile({ name: "batal-hapus.txt", bytes: Buffer.from("aman") });
+    const deleteStorageKey = deleteItem.storageKey!;
+    const deleteOperationId = randomUUID();
+    const deleteFinalPath = vault.filePath(deleteItem.id);
+    setup.database
+      .prepare(
+        "INSERT INTO vault_fs_operations(id, operation, storage_key) VALUES (?, 'delete', ?)",
+      )
+      .run(deleteOperationId, deleteStorageKey);
+    fs.renameSync(
+      deleteFinalPath,
+      path.join(vault.storagePath, ".trash", deleteOperationId),
+    );
+
+    const recovered = new VaultService(setup.database, vault.storagePath);
+
+    expect(fs.readFileSync(recovered.filePath(saveItemId), "utf8")).toBe("dipulihkan");
+    expect(fs.readFileSync(recovered.filePath(deleteItem.id), "utf8")).toBe("aman");
+    expect(
+      (setup.database.prepare("SELECT count(*) AS count FROM vault_fs_operations").get() as {
+        count: number;
+      }).count,
+    ).toBe(0);
+  });
+
+  it("purges trash after metadata deletion committed before cleanup", () => {
+    const file = vault.saveFile({ name: "hapus.txt", bytes: Buffer.from("hapus") });
+    const operationId = randomUUID();
+    const trashPath = path.join(vault.storagePath, ".trash", operationId);
+    setup.database
+      .prepare(
+        "INSERT INTO vault_fs_operations(id, operation, storage_key) VALUES (?, 'delete', ?)",
+      )
+      .run(operationId, file.storageKey);
+    fs.renameSync(vault.filePath(file.id), trashPath);
+    setup.database.prepare("DELETE FROM vault_items WHERE id = ?").run(file.id);
+
+    new VaultService(setup.database, vault.storagePath);
+
+    expect(fs.existsSync(trashPath)).toBe(false);
+    expect(
+      (setup.database.prepare("SELECT count(*) AS count FROM vault_fs_operations").get() as {
+        count: number;
+      }).count,
+    ).toBe(0);
   });
 });

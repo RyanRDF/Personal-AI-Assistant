@@ -93,19 +93,36 @@ export class MemoryService {
   }
 
   relevant(query: string, limit: number): MemoryItem[] {
-    const ranked = this.list(Math.max(limit * 5, 50)).map((item, index) => ({
-      item,
-      score: memoryRelevance(query, item.content),
+    if (limit <= 0) return [];
+
+    // `limit` is a per-class bound: keep up to `limit` newest preferences independently
+    // from up to `limit` relevant non-preferences, for a hard total bound of 2 * limit.
+    const preferences = (
+      this.database
+        .prepare(
+          "SELECT * FROM memories WHERE kind = 'preference' ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .all(limit) as MemoryRow[]
+    ).map(mapRow);
+    const factCandidateLimit = Math.max(limit * 5, 50);
+    const rankedFacts = (
+      this.database
+        .prepare(
+          "SELECT * FROM memories WHERE kind <> 'preference' ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .all(factCandidateLimit) as MemoryRow[]
+    ).map((row, index) => ({
+      item: mapRow(row),
+      score: memoryRelevance(query, row.content),
       recency: index,
     }));
-    const alwaysOnPreferences = ranked.filter(({ item }) => item.kind === "preference");
-    const relevantContext = ranked
-      .filter(({ item, score }) => item.kind !== "preference" && score > 0)
-      .sort((a, b) => b.score - a.score || a.recency - b.recency);
-    return [...alwaysOnPreferences, ...relevantContext]
+    const relevantFacts = rankedFacts
+      .filter(({ score }) => score > 0)
       .sort((a, b) => b.score - a.score || a.recency - b.recency)
       .slice(0, limit)
       .map(({ item }) => item);
+
+    return [...preferences, ...relevantFacts];
   }
 
   update(id: number, kind: MemoryKind, content: string): MemoryItem | null {

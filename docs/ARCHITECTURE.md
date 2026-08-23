@@ -38,13 +38,13 @@ SQLite menyimpan riwayat pendek dan memori jangka panjang secara terpisah. Retri
 
 ### Vault
 
-`VaultService` memakai SQLite untuk struktur folder, nama, tipe, hash, sumber Telegram, dan isi catatan. Byte file memakai nama storage key acak di `VAULT_STORAGE_PATH`, sehingga nama pengguna tidak pernah menjadi path filesystem. Unique index pada `(parent, lower(name))` menolak nama duplikat di folder yang sama. Move mencegah siklus folder; delete rekursif membersihkan metadata dan byte file.
+`VaultService` memakai SQLite untuk struktur folder, nama, tipe, hash, sumber Telegram, dan isi catatan. Byte file memakai nama storage key acak di `VAULT_STORAGE_PATH`, sehingga nama pengguna tidak pernah menjadi path filesystem. Unique index pada `(parent, lower(name))` menolak nama duplikat di folder yang sama. Operasi file memakai journal SQLite serta staging/trash pada volume yang sama; startup merekonsiliasi operasi yang terputus. Path folder divalidasi penuh sebelum dibuat dalam satu transaksi.
 
-Catatan dan nama file yang relevan dimasukkan sebagai data tidak tepercaya ke konteks assistant. Tool read-only dapat mencari item dan mengantrekan file untuk dikirim kembali ke chat Telegram pemilik.
+Konteks otomatis dan pencarian vault hanya memasukkan metadata sebagai data tidak tepercaya. Isi note penuh hanya tersedia melalui tool read yang diotorisasi dari permintaan eksplisit pemilik; turn yang membaca note sensitif tidak diberi tool egress jaringan. Tool read-only tetap dapat mencari item dan mengantrekan file untuk dikirim kembali ke chat Telegram pemilik.
 
 ### Dashboard
 
-Server HTTP bawaan menyediakan dashboard file manager, API vault, dan `/health`. Dashboard hanya dapat berjalan tanpa token pada interface loopback. Bind ke container/jaringan mewajibkan Basic Auth melalui `DASHBOARD_TOKEN`. Endpoint health tidak menampilkan isi file atau secret.
+Server HTTP bawaan menyediakan dashboard file manager, API vault, dan `/health`. Dashboard hanya dapat berjalan tanpa token pada interface loopback. Bind ke container/jaringan mewajibkan Basic Auth melalui `DASHBOARD_TOKEN`. Endpoint health publik hanya mengembalikan `{ "ok": true }`; statistik rinci berada di `/api/status` yang terautentikasi.
 
 ### Gmail
 
@@ -67,7 +67,7 @@ gpt-4o-mini semantic match
           └── cocok → outbox SQLite → kirim Telegram
 ```
 
-Cursor baru disimpan setelah tidak ada kegagalan transient. Fetch, klasifikasi, dan pengiriman dicoba ulang sampai `EMAIL_MAX_RETRIES`; kegagalan terminal masuk dead-letter sehingga cursor tetap dapat bergerak. Unique key `(rule_id, gmail_message_id)` mencegah satu rule dievaluasi/diantrekan dua kali. Jika cursor Gmail kedaluwarsa, aplikasi membuat baseline baru tanpa replay massal.
+Cursor dan epoch checkpoint baru disimpan bersama setelah tidak ada kegagalan transient. Fetch, klasifikasi, dan pengiriman dicoba ulang sampai `EMAIL_MAX_RETRIES`; kegagalan terminal masuk dead-letter sehingga cursor tetap dapat bergerak. Unique key `(rule_id, gmail_message_id)` mencegah satu rule dievaluasi/diantrekan dua kali. Jika cursor Gmail kedaluwarsa, aplikasi melakukan catch-up paginated sejak checkpoint sukses terakhir; database lama memakai fallback tujuh hari.
 
 Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan tetapi sebelum transaksi status `sent` selesai dapat menghasilkan duplikat langka; exactly-once tidak dapat dijamin oleh Telegram Bot API tanpa transaksi lintas layanan.
 
@@ -82,6 +82,7 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 | `messages` | Riwayat percakapan pendek per Telegram chat |
 | `memories` | Preferensi/fakta/komitmen personal |
 | `vault_items` | Struktur folder, catatan, dan metadata file vault |
+| `vault_fs_operations` | Journal staging/trash untuk recovery operasi file vault |
 | `email_rules` | Deskripsi semantik dan Gmail query opsional |
 | `email_evaluations` | Deduplikasi dan audit hasil rule-message |
 | `email_processing_failures` | Retry/dead-letter fetch dan klasifikasi |
@@ -94,7 +95,7 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 
 - Telegram identity adalah authorization boundary utama.
 - `.env` adalah secret boundary dan tidak masuk Git.
-- Email, web, data vault, dan teks di dalam gambar merupakan input tidak tepercaya.
+- Email, web, memory, data vault, dan teks di dalam gambar merupakan input tidak tepercaya.
 - Gambar dikirim ke model sebagai data URL dan tidak disimpan di database atau log.
 - Subject, snippet, dan body email yang dipotong dikirim ke OpenAI untuk klasifikasi/pencarian; tidak ditulis ke log.
 - OpenAI tidak diberi tool shell, email send, atau delete; mutasi vault hanya tersedia untuk intent eksplisit.

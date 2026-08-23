@@ -32,7 +32,9 @@ describe("vault dashboard", () => {
   });
 
   it("keeps health public but protects vault data", async () => {
-    expect((await fetch(`${baseUrl}/health`)).status).toBe(200);
+    const health = await fetch(`${baseUrl}/health`);
+    expect(health.status).toBe(200);
+    expect(await health.json()).toEqual({ ok: true });
     expect((await fetch(`${baseUrl}/api/items`)).status).toBe(401);
     expect(
       (await fetch(`${baseUrl}/api/items`, { headers: { authorization } })).status,

@@ -210,6 +210,7 @@ Salin `.env.example` menjadi `.env`, lalu ubah hanya nilai yang diperlukan. Nila
 | `GMAIL_MATCH_THRESHOLD` | Tidak | Confidence notifikasi semantik `0..1`; default `0.72` |
 | `GMAIL_MAX_BODY_CHARS` | Tidak | Potongan body yang dianalisis; default `6000` |
 | `EMAIL_MAX_RETRIES` | Tidak | Retry sebelum dead-letter; default `3` |
+| `EMAIL_CLASSIFIER_TIMEOUT_SECONDS` | Tidak | Batas waktu satu klasifikasi email; default `30`, rentang `1..600` detik |
 
 ### Web search
 
@@ -305,7 +306,7 @@ Model akan membuat aturan persisten. Poller mengambil hanya perubahan baru melal
 - `/resume_watch <id>` untuk mengaktifkan.
 - `/delete_watch <id>` untuk menghapus.
 
-Saat pertama diaktifkan, poller membuat baseline dan tidak membanjiri Telegram dengan email lama. Untuk email yang sudah ada, tanyakan langsung, misalnya `Cari email tentang tiket penerbangan bulan lalu`.
+Saat pertama diaktifkan, poller membuat baseline dan tidak membanjiri Telegram dengan email lama. Jika Gmail History cursor kedaluwarsa, poller melakukan catch-up paginated sejak checkpoint sukses terakhir sebelum menyimpan cursor baru; database lama tanpa checkpoint memakai fallback tujuh hari. Untuk email yang sudah ada, tanyakan langsung, misalnya `Cari email tentang tiket penerbangan bulan lalu`.
 
 Subject, snippet, dan potongan body email dikirim ke model OpenAI yang dikonfigurasi untuk pencarian dan klasifikasi semantik. Konten tersebut tidak ditulis ke log; teks notifikasi yang sempat masuk outbox lokal juga dibersihkan setelah berhasil dikirim. Jika pemrosesan atau pengiriman gagal, sistem mencoba ulang sampai `EMAIL_MAX_RETRIES`, lalu menandainya sebagai dead-letter yang terlihat di `/status` agar satu email rusak tidak menghentikan seluruh cursor.
 
@@ -364,7 +365,7 @@ Perintah:
 - `/clear_memory CONFIRM` menghapus seluruh memori personal.
 - `/clear_chat CONFIRM` menghapus riwayat pendek dan pesan Telegram yang tercatat dalam batas 48 jam Bot API, tanpa menghapus memori atau isi vault. Pesan yang lebih lama harus dihapus manual melalui aplikasi Telegram.
 
-Memori memakai pencarian lexical lokal agar tidak membutuhkan embedding API dan tidak menambah biaya. Preferensi selalu tersedia sebagai konteks, sedangkan fakta lain hanya dimuat bila relevan dengan pertanyaan. Riwayat chat yang lebih lama dari `MESSAGE_RETENTION_DAYS` (default 90 hari) dibersihkan saat startup. Desain provider memungkinkan semantic/embedding retrieval ditambahkan nanti.
+Memori memakai pencarian lexical lokal agar tidak membutuhkan embedding API dan tidak menambah biaya. Hingga `MAX_MEMORY_ITEMS` preferensi terbaru dimuat terpisah dari maksimal jumlah fakta relevan yang sama, sehingga fakta tidak menyingkirkan preferensi. Seluruh memori tetap diperlakukan sebagai data tidak tepercaya, bukan instruksi sistem. Riwayat chat yang lebih lama dari `MESSAGE_RETENTION_DAYS` (default 90 hari) dibersihkan saat startup. Desain provider memungkinkan semantic/embedding retrieval ditambahkan nanti.
 
 ## Vault dan dashboard
 
@@ -372,7 +373,7 @@ Forward chat atau dokumen non-gambar ke bot untuk menyimpannya langsung. Foto da
 
 Bot dapat membaca kembali isi note apa pun yang diminta pemilik, termasuk credential pribadi yang sengaja disimpan sendiri, misalnya `Tampilkan akun dan password dashboard Railway yang saya simpan`. Akses ini hanya bekerja dari private chat dengan `TELEGRAM_ALLOWED_USER_ID`; secret runtime aplikasi seperti API key, token bot, environment variable, dan isi log tetap tidak dapat diambil. Karena hasilnya terlihat di riwayat Telegram, hapus pesan setelah digunakan atau jalankan `/clear_chat CONFIRM` bila sesuai.
 
-Operasi note memakai kemampuan umum untuk membuat, menambahkan, atau mengganti konten. Permintaan jelas dieksekusi langsung tanpa konfirmasi format atau saran tambahan. Contoh: kirim `personal-ai-assistant-production.up.railway.app` lalu tulis `Tolong simpan ini sebagai link dashboard Railway`; bot memakai `https://`, menambahkannya ke note terkait, dan nanti menjawab `Berikan link dashboard Railway` dari vault tanpa pencarian web. Prinsip yang sama berlaku untuk catatan, agenda, akun, alamat, dan data pribadi lain.
+Operasi note memakai kemampuan umum untuk membuat, menambahkan, atau mengganti konten. Letakkan instruksi pada awal pesan dan konten setelahnya agar teks yang ditempel tidak dapat memberikan izin mutasi, misalnya `Tolong simpan link berikut sebagai dashboard Railway:\npersonal-ai-assistant-production.up.railway.app`. Bot memakai `https://`, menambahkannya ke note terkait, dan nanti menjawab `Berikan link dashboard Railway` dari vault tanpa pencarian web. Prinsip yang sama berlaku untuk catatan, agenda, akun, alamat, dan data pribadi lain.
 
 Contoh alur:
 
@@ -435,7 +436,7 @@ Lanjutkan dengan uji fungsional lokal:
 
 ### Pilihan A — Railway + persistent volume (direkomendasikan untuk 24/7)
 
-Repository sudah menyertakan `railway.json`, healthcheck `/health`, restart policy, dan Dockerfile. Buat satu service dari GitHub, pasang volume pada `/app/data`, gunakan tepat satu replica, lalu set `DATABASE_PATH=/app/data/assistant.sqlite`, `VAULT_STORAGE_PATH=/app/data/vault`, `DASHBOARD_HOST=0.0.0.0`, `DASHBOARD_TOKEN`, dan `RAILWAY_RUN_UID=0`. Railway akan menginjeksi `PORT`.
+Repository sudah menyertakan `railway.json`, healthcheck `/health`, restart policy, dan Dockerfile. Endpoint `/health` sengaja hanya mengembalikan `{ "ok": true }`; statistik rinci tetap tersedia melalui `/api/status` yang terautentikasi. Buat satu service dari GitHub, pasang volume pada `/app/data`, gunakan tepat satu replica, lalu set `DATABASE_PATH=/app/data/assistant.sqlite`, `VAULT_STORAGE_PATH=/app/data/vault`, `DASHBOARD_HOST=0.0.0.0`, `DASHBOARD_TOKEN`, dan `RAILWAY_RUN_UID=0`. Railway akan menginjeksi `PORT`.
 
 Panduan lengkap, topologi, daftar variable, backup/restore, dan alternatif Fly.io ada di [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
@@ -531,7 +532,7 @@ sudo journalctl -u personal-ai-assistant -f
 
 ### Data persisten dan backup
 
-SQLite, memori, aturan email, cursor Gmail, trace, dan seluruh byte file vault tersimpan pada `./data`. Untuk backup yang konsisten:
+SQLite, memori, aturan email, cursor/checkpoint Gmail, trace, journal recovery vault, dan seluruh byte file vault tersimpan pada `./data`. Operasi file vault memakai staging/trash yang direkonsiliasi saat startup, tetapi backup tetap harus mencakup database dan direktori vault sebagai satu kesatuan. Untuk backup yang konsisten:
 
 1. Hentikan proses/container assistant.
 2. Salin seluruh folder `data` ke lokasi backup yang terenkripsi atau aksesnya terbatas.
@@ -597,6 +598,7 @@ Selain perintah tersebut, gunakan bahasa natural untuk bertanya, menerjemahkan, 
 - Bot menolak semua user selain ID pemilik dan menolak group chat.
 - Gmail memakai read-only scope.
 - Email, hasil web, isi vault, dan teks di dalam gambar diperlakukan sebagai untrusted data dalam prompt.
+- Pencarian dan konteks otomatis vault hanya mengirim metadata. Isi note penuh hanya dimuat setelah permintaan eksplisit; tool jaringan dinonaktifkan pada turn yang membaca note sensitif.
 - Tool yang mengubah memori atau aturan hanya tersedia bila klausa awal pesan pemilik secara eksplisit meminta aksi tersebut; penghapusan hanya melalui command deterministik.
 - Subject/body email tidak ditulis ke log aplikasi.
 - Riwayat, memori, dan seluruh isi vault tersimpan dalam bentuk plaintext; lindungi folder/volume `data`, backup, serta dashboard.

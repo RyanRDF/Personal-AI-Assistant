@@ -61,6 +61,15 @@ CREATE INDEX IF NOT EXISTS idx_vault_parent_kind
 CREATE INDEX IF NOT EXISTS idx_vault_sha256
   ON vault_items(sha256) WHERE sha256 IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS vault_fs_operations (
+  id TEXT PRIMARY KEY,
+  operation TEXT NOT NULL CHECK (operation IN ('save', 'delete')),
+  storage_key TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_vault_fs_operations_storage_key
+  ON vault_fs_operations(storage_key);
+
 CREATE TABLE IF NOT EXISTS email_rules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   description TEXT NOT NULL,

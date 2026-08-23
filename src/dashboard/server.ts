@@ -232,7 +232,7 @@ export async function startDashboard(
     void (async () => {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       if (url.pathname === "/health") {
-        sendJson(response, 200, statusSnapshot(dependencies.database, dependencies.vault));
+        sendJson(response, 200, { ok: true });
         return;
       }
       if (!authorized(request, config.DASHBOARD_TOKEN)) {

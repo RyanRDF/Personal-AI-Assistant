@@ -25,6 +25,25 @@ describe("web search providers", () => {
     ]);
   });
 
+  it("combines caller cancellation with the Brave timeout", async () => {
+    const controller = new AbortController();
+    const fetcher = vi.fn(
+      async (_input: URL | RequestInfo, init?: RequestInit) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+            once: true,
+          });
+        }),
+    );
+    const provider = new BraveSearchProvider("key", 5, fetcher as typeof fetch);
+    const pending = provider.search("berita AI", undefined, controller.signal);
+
+    controller.abort(new DOMException("dibatalkan", "AbortError"));
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetcher.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+  });
+
   it("normalizes SearXNG and preserves citation URLs", async () => {
     const fetcher = vi.fn(async () =>
       new Response(
@@ -41,5 +60,23 @@ describe("web search providers", () => {
     );
     const results = await provider.search("dokumentasi");
     expect(formatSearchResults(results, provider.name)).toContain("https://example.org/doc");
+  });
+
+  it("passes caller cancellation to SearXNG requests", async () => {
+    const controller = new AbortController();
+    const fetcher = vi.fn(
+      async (_input: URL | RequestInfo, _init?: RequestInit) =>
+        new Response(JSON.stringify({ results: [] })),
+    );
+    const provider = new SearxngSearchProvider(
+      "http://localhost:8080",
+      5,
+      fetcher as typeof fetch,
+    );
+
+    await provider.search("dokumentasi", 3, controller.signal);
+    controller.abort();
+
+    expect(fetcher.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
   });
 });

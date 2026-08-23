@@ -20,6 +20,19 @@ interface VaultRow {
   updated_at: string;
 }
 
+interface VaultFsOperationRow {
+  id: string;
+  operation: "save" | "delete";
+  storage_key: string;
+}
+
+interface VaultDeleteMove {
+  operationId: string;
+  storageKey: string;
+  finalPath: string;
+  trashPath: string;
+}
+
 export interface VaultSource {
   chatId?: string;
   messageId?: string;
@@ -104,13 +117,20 @@ function relevance(query: string, item: VaultItem): number {
 
 export class VaultService {
   readonly storagePath: string;
+  private readonly temporaryPath: string;
+  private readonly trashPath: string;
 
   constructor(
     private readonly database: Database.Database,
     storagePath: string,
   ) {
     this.storagePath = path.resolve(storagePath);
+    this.temporaryPath = path.join(this.storagePath, ".tmp");
+    this.trashPath = path.join(this.storagePath, ".trash");
     fs.mkdirSync(this.storagePath, { recursive: true });
+    fs.mkdirSync(this.temporaryPath, { recursive: true });
+    fs.mkdirSync(this.trashPath, { recursive: true });
+    this.reconcileFilesystemOperations();
   }
 
   get(id: number): VaultItem | null {
@@ -169,20 +189,22 @@ export class VaultService {
       .split(/[\\/]+/u)
       .map((part) => part.trim())
       .filter(Boolean);
-    let parentId: number | null = null;
-    let current: VaultItem | null = null;
-    for (const part of parts) {
-      const normalized = normalizeVaultName(part);
-      const existing = this.findDuplicateName(normalized, parentId);
-      if (existing && existing.kind !== "folder") {
-        throw new InvalidVaultOperationError(
-          `\"${normalized}\" sudah dipakai oleh ${existing.kind}, bukan folder.`,
-        );
+    const normalizedParts = parts.map(normalizeVaultName);
+    return this.database.transaction(() => {
+      let parentId: number | null = null;
+      let current: VaultItem | null = null;
+      for (const normalized of normalizedParts) {
+        const existing = this.findDuplicateName(normalized, parentId);
+        if (existing && existing.kind !== "folder") {
+          throw new InvalidVaultOperationError(
+            `\"${normalized}\" sudah dipakai oleh ${existing.kind}, bukan folder.`,
+          );
+        }
+        current = existing ?? this.createFolder(normalized, parentId);
+        parentId = current.id;
       }
-      current = existing ?? this.createFolder(normalized, parentId);
-      parentId = current.id;
-    }
-    return current;
+      return current;
+    })();
   }
 
   resolveFolderPath(folderPath: string): VaultItem | null {
@@ -275,12 +297,14 @@ export class VaultService {
     if (duplicate) throw new DuplicateVaultItemError(duplicate);
 
     const storageKey = randomUUID();
+    const operationId = randomUUID();
     const finalPath = this.storageFilePath(storageKey);
-    const temporaryPath = `${finalPath}.tmp`;
+    const temporaryPath = this.operationFilePath("save", operationId);
     const bytes = Buffer.from(input.bytes);
     fs.writeFileSync(temporaryPath, bytes, { flag: "wx" });
-    fs.renameSync(temporaryPath, finalPath);
+    let itemId: number | null = null;
     try {
+      this.recordFilesystemOperation(operationId, "save", storageKey);
       const result = this.database
         .prepare(
           `INSERT INTO vault_items(
@@ -298,11 +322,14 @@ export class VaultService {
           input.chatId ?? null,
           input.messageId ?? null,
         );
-      return this.get(Number(result.lastInsertRowid))!;
+      itemId = Number(result.lastInsertRowid);
+      fs.renameSync(temporaryPath, finalPath);
     } catch (error) {
-      fs.rmSync(finalPath, { force: true });
+      this.compensateFailedSave(operationId, storageKey, temporaryPath, itemId);
       throw error;
     }
+    this.forgetFilesystemOperation(operationId);
+    return this.requireItem(itemId);
   }
 
   rename(id: number, name: string): VaultItem {
@@ -361,8 +388,26 @@ export class VaultService {
             )
             .get(id) as { count: number }).count
         : 1;
-    this.database.prepare("DELETE FROM vault_items WHERE id = ?").run(id);
-    for (const row of fileRows) fs.rmSync(this.storageFilePath(row.storage_key), { force: true });
+    const moves: VaultDeleteMove[] = [];
+    try {
+      for (const row of fileRows) {
+        const finalPath = this.storageFilePath(row.storage_key);
+        if (!fs.existsSync(finalPath)) continue;
+        const operationId = randomUUID();
+        const trashPath = this.operationFilePath("delete", operationId);
+        this.recordFilesystemOperation(operationId, "delete", row.storage_key);
+        const move = { operationId, storageKey: row.storage_key, finalPath, trashPath };
+        moves.push(move);
+        fs.renameSync(finalPath, trashPath);
+      }
+      this.database.transaction(() => {
+        this.database.prepare("DELETE FROM vault_items WHERE id = ?").run(id);
+      })();
+    } catch (error) {
+      this.restoreDeleteMoves(moves);
+      throw error;
+    }
+    for (const move of moves) this.finalizeDeleteMove(move);
     return count;
   }
 
@@ -436,6 +481,181 @@ export class VaultService {
     const filePath = this.storageFilePath(item.storageKey);
     if (!fs.existsSync(filePath)) throw new InvalidVaultOperationError("Byte file tidak ditemukan.");
     return filePath;
+  }
+
+  private recordFilesystemOperation(
+    id: string,
+    operation: VaultFsOperationRow["operation"],
+    storageKey: string,
+  ): void {
+    this.database
+      .prepare(
+        "INSERT INTO vault_fs_operations(id, operation, storage_key) VALUES (?, ?, ?)",
+      )
+      .run(id, operation, storageKey);
+  }
+
+  private forgetFilesystemOperation(id: string): void {
+    try {
+      this.database.prepare("DELETE FROM vault_fs_operations WHERE id = ?").run(id);
+    } catch {
+      // The completed operation is safe; a leftover journal row is idempotently
+      // reconciled the next time VaultService starts.
+    }
+  }
+
+  private operationFilePath(operation: VaultFsOperationRow["operation"], id: string): string {
+    if (!/^[0-9a-f-]{36}$/iu.test(id)) {
+      throw new InvalidVaultOperationError("ID operasi filesystem vault tidak valid.");
+    }
+    return path.join(operation === "save" ? this.temporaryPath : this.trashPath, id);
+  }
+
+  private hasStorageMetadata(storageKey: string): boolean {
+    return Boolean(
+      this.database
+        .prepare("SELECT 1 FROM vault_items WHERE storage_key = ? LIMIT 1")
+        .get(storageKey),
+    );
+  }
+
+  private compensateFailedSave(
+    operationId: string,
+    storageKey: string,
+    temporaryPath: string,
+    itemId: number | null,
+  ): void {
+    if (itemId !== null) {
+      try {
+        this.database.prepare("DELETE FROM vault_items WHERE id = ?").run(itemId);
+      } catch {
+        // Keep the journal so startup reconciliation can complete or compensate.
+      }
+    }
+    let metadataExists = true;
+    try {
+      metadataExists = this.hasStorageMetadata(storageKey);
+    } catch {
+      return;
+    }
+    if (metadataExists) return;
+    try {
+      fs.rmSync(temporaryPath, { force: true });
+    } catch {
+      return;
+    }
+    this.forgetFilesystemOperation(operationId);
+  }
+
+  private restoreDeleteMoves(moves: VaultDeleteMove[]): void {
+    for (const move of [...moves].reverse()) {
+      try {
+        if (fs.existsSync(move.trashPath)) {
+          if (fs.existsSync(move.finalPath)) {
+            fs.rmSync(move.trashPath, { force: true });
+          } else {
+            fs.renameSync(move.trashPath, move.finalPath);
+          }
+        }
+        if (fs.existsSync(move.finalPath) && !fs.existsSync(move.trashPath)) {
+          this.forgetFilesystemOperation(move.operationId);
+        }
+      } catch {
+        // Do not overwrite a destination on Windows. The journal retains enough
+        // identity to retry this compensation safely on the next startup.
+      }
+    }
+  }
+
+  private finalizeDeleteMove(move: VaultDeleteMove): void {
+    try {
+      fs.rmSync(move.trashPath, { force: true });
+    } catch {
+      return;
+    }
+    this.forgetFilesystemOperation(move.operationId);
+  }
+
+  private reconcileFilesystemOperations(): void {
+    const operations = this.database
+      .prepare("SELECT id, operation, storage_key FROM vault_fs_operations ORDER BY created_at, id")
+      .all() as VaultFsOperationRow[];
+    for (const operation of operations) {
+      try {
+        const finalPath = this.storageFilePath(operation.storage_key);
+        const operationPath = this.operationFilePath(operation.operation, operation.id);
+        const metadataExists = this.hasStorageMetadata(operation.storage_key);
+        if (operation.operation === "save") {
+          if (metadataExists) {
+            if (!fs.existsSync(finalPath) && fs.existsSync(operationPath)) {
+              fs.renameSync(operationPath, finalPath);
+            } else if (fs.existsSync(finalPath) && fs.existsSync(operationPath)) {
+              fs.rmSync(operationPath, { force: true });
+            }
+            if (fs.existsSync(finalPath)) {
+              this.forgetFilesystemOperation(operation.id);
+            } else if (!fs.existsSync(operationPath)) {
+              this.database
+                .prepare("DELETE FROM vault_items WHERE storage_key = ?")
+                .run(operation.storage_key);
+              this.forgetFilesystemOperation(operation.id);
+            }
+          } else {
+            fs.rmSync(operationPath, { force: true });
+            fs.rmSync(finalPath, { force: true });
+            this.forgetFilesystemOperation(operation.id);
+          }
+          continue;
+        }
+
+        if (metadataExists) {
+          if (!fs.existsSync(finalPath) && fs.existsSync(operationPath)) {
+            fs.renameSync(operationPath, finalPath);
+          } else if (fs.existsSync(finalPath) && fs.existsSync(operationPath)) {
+            fs.rmSync(operationPath, { force: true });
+          }
+          if (fs.existsSync(finalPath)) this.forgetFilesystemOperation(operation.id);
+        } else {
+          fs.rmSync(operationPath, { force: true });
+          fs.rmSync(finalPath, { force: true });
+          this.forgetFilesystemOperation(operation.id);
+        }
+      } catch {
+        // Keep the journal row and retry after the transient filesystem condition
+        // (for example, a Windows file handle) has cleared.
+      }
+    }
+    this.removeUntrackedOperationFiles(operations);
+  }
+
+  private removeUntrackedOperationFiles(operations: VaultFsOperationRow[]): void {
+    const trackedTemporary = new Set(
+      operations.filter(({ operation }) => operation === "save").map(({ id }) => id),
+    );
+    const trackedTrash = new Set(
+      operations.filter(({ operation }) => operation === "delete").map(({ id }) => id),
+    );
+    for (const [directory, tracked] of [
+      [this.temporaryPath, trackedTemporary],
+      [this.trashPath, trackedTrash],
+    ] as const) {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (!entry.isFile() || tracked.has(entry.name)) continue;
+        try {
+          fs.rmSync(path.join(directory, entry.name), { force: true });
+        } catch {
+          // A later startup will retry orphan cleanup.
+        }
+      }
+    }
+    for (const entry of fs.readdirSync(this.storagePath, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^[0-9a-f-]{36}\.tmp$/iu.test(entry.name)) continue;
+      try {
+        fs.rmSync(path.join(this.storagePath, entry.name), { force: true });
+      } catch {
+        // Retry legacy orphan cleanup on a later startup.
+      }
+    }
   }
 
   private storageFilePath(storageKey: string): string {

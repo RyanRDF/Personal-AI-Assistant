@@ -14,7 +14,10 @@ describe("Gmail semantic watcher", () => {
     setup = temporaryDatabase();
   });
 
-  afterEach(() => setup.cleanup());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setup.cleanup();
+  });
 
   it("notifies once for a semantic match and persists deduplication", async () => {
     const config = testConfig();
@@ -154,6 +157,248 @@ describe("Gmail semantic watcher", () => {
       )
       .get(rule.id, "m-1") as { status: string; message_text: string };
     expect(delivery).toEqual({ status: "sent", message_text: "[delivered]" });
+  });
+
+  it("times out a stalled notification without advancing the Gmail checkpoint", async () => {
+    const config = testConfig();
+    const rules = new EmailRuleService(setup.database);
+    const rule = rules.create("email invoice");
+    rules.queueNotification(rule.id, "queued-message", "queued notification");
+    setState(setup.database, "gmail_history_id", "10");
+    const gmail = {
+      listNewMessageIds: vi.fn(async () => ({ messageIds: [], latestHistoryId: "11" })),
+    } as unknown as GmailService;
+    const classifier = { classify: vi.fn() } as unknown as EmailClassifier;
+    const notifier = vi.fn(
+      async () => await new Promise<void>(() => {
+        // Deliberately never settles; EmailWatcher must enforce its own deadline.
+      }),
+    );
+    const watcher = new EmailWatcher(
+      config,
+      setup.database,
+      gmail,
+      rules,
+      classifier,
+      notifier,
+      createLogger(config),
+      10,
+    );
+
+    await watcher.runOnce();
+
+    expect(notifier).toHaveBeenCalledOnce();
+    expect(getState(setup.database, "gmail_history_id")).toBe("10");
+    expect(rules.pendingNotifications(config.EMAIL_MAX_RETRIES)).toHaveLength(1);
+  });
+
+  it("cancels a stalled notification during graceful shutdown", async () => {
+    const config = testConfig();
+    const rules = new EmailRuleService(setup.database);
+    const rule = rules.create("email invoice");
+    rules.queueNotification(rule.id, "queued-message", "queued notification");
+    setState(setup.database, "gmail_history_id", "10");
+    const gmail = {
+      listNewMessageIds: vi.fn(async () => ({ messageIds: [], latestHistoryId: "11" })),
+    } as unknown as GmailService;
+    const classifier = { classify: vi.fn() } as unknown as EmailClassifier;
+    const notifier = vi.fn(
+      async () => await new Promise<void>(() => {
+        // Deliberately ignores AbortSignal to exercise the local cancellation race.
+      }),
+    );
+    const watcher = new EmailWatcher(
+      config,
+      setup.database,
+      gmail,
+      rules,
+      classifier,
+      notifier,
+      createLogger(config),
+    );
+
+    const run = watcher.runOnce();
+    await vi.waitFor(() => expect(notifier).toHaveBeenCalledOnce());
+    const stopped = await Promise.race([
+      watcher.stopAndWait().then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
+    ]);
+    await run;
+
+    expect(stopped).toBe(true);
+    expect(getState(setup.database, "gmail_history_id")).toBe("10");
+    expect(rules.pendingNotifications(config.EMAIL_MAX_RETRIES)).toHaveLength(1);
+  });
+
+  it("delivers pending notifications even when message processing will retry", async () => {
+    const config = testConfig();
+    const rules = new EmailRuleService(setup.database);
+    const rule = rules.create("email invoice");
+    rules.queueNotification(rule.id, "old-message", "queued notification");
+    setState(setup.database, "gmail_history_id", "10");
+    const gmail = {
+      listNewMessageIds: vi.fn(async () => ({ messageIds: ["broken"], latestHistoryId: "11" })),
+      getMessage: vi.fn(async () => {
+        throw new Error("Gmail temporarily unavailable");
+      }),
+    } as unknown as GmailService;
+    const classifier = { classify: vi.fn() } as unknown as EmailClassifier;
+    const notifier = vi.fn(async () => undefined);
+    const watcher = new EmailWatcher(
+      config,
+      setup.database,
+      gmail,
+      rules,
+      classifier,
+      notifier,
+      createLogger(config),
+    );
+
+    await watcher.runOnce();
+
+    expect(notifier).toHaveBeenCalledWith("queued notification", expect.any(AbortSignal));
+    expect(rules.pendingNotifications(config.EMAIL_MAX_RETRIES)).toHaveLength(0);
+    expect(getState(setup.database, "gmail_history_id")).toBe("10");
+  });
+
+  it("catches up from the persisted successful epoch when history expires", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(2_000_000_000_000);
+    const config = testConfig();
+    const rules = new EmailRuleService(setup.database);
+    rules.create("email penting");
+    setState(setup.database, "gmail_history_id", "100");
+    setState(setup.database, "gmail_last_success_epoch", "1999999900");
+    const gmail = {
+      listNewMessageIds: vi.fn(async () => {
+        throw { response: { status: 404 } };
+      }),
+      getCurrentHistoryId: vi.fn(async () => "200"),
+      searchMessageIds: vi.fn(async () => ["catch-up-message"]),
+      getMessage: vi.fn(async () => ({
+        id: "catch-up-message",
+        threadId: "catch-up-thread",
+        from: "sender@example.com",
+        to: "owner@example.com",
+        subject: "Important",
+        date: "today",
+        snippet: "important",
+        body: "important",
+      })),
+    } as unknown as GmailService;
+    const classifier = {
+      classify: vi.fn(async () => ({
+        match: false,
+        confidence: 0.1,
+        reason: "not relevant",
+        summary: "not relevant",
+      })),
+    } as unknown as EmailClassifier;
+    const watcher = new EmailWatcher(
+      config,
+      setup.database,
+      gmail,
+      rules,
+      classifier,
+      vi.fn(async () => undefined),
+      createLogger(config),
+    );
+
+    await watcher.runOnce();
+
+    expect(gmail.searchMessageIds).toHaveBeenCalledWith(
+      "after:1999999900 -in:sent -in:drafts",
+      Number.POSITIVE_INFINITY,
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(classifier.classify).toHaveBeenCalledOnce();
+    expect(getState(setup.database, "gmail_history_id")).toBe("200");
+    expect(getState(setup.database, "gmail_last_success_epoch")).toBe("2000000000");
+  });
+
+  it("keeps the old catch-up checkpoint until transient work succeeds", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(2_000_000_000_000);
+    const config = testConfig();
+    const rules = new EmailRuleService(setup.database);
+    rules.create("email penting");
+    setState(setup.database, "gmail_history_id", "100");
+    setState(setup.database, "gmail_last_success_epoch", "1999999900");
+    const gmail = {
+      listNewMessageIds: vi.fn(async () => {
+        throw { response: { status: 404 } };
+      }),
+      getCurrentHistoryId: vi.fn(async () => "200"),
+      searchMessageIds: vi.fn(async () => ["catch-up-message"]),
+      getMessage: vi.fn(async () => ({
+        id: "catch-up-message",
+        threadId: "catch-up-thread",
+        from: "sender@example.com",
+        to: "owner@example.com",
+        subject: "Important",
+        date: "today",
+        snippet: "important",
+        body: "important",
+      })),
+    } as unknown as GmailService;
+    const classifier = {
+      classify: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("OpenAI temporarily unavailable"))
+        .mockResolvedValueOnce({
+          match: false,
+          confidence: 0.1,
+          reason: "not relevant",
+          summary: "not relevant",
+        }),
+    } as unknown as EmailClassifier;
+    const watcher = new EmailWatcher(
+      config,
+      setup.database,
+      gmail,
+      rules,
+      classifier,
+      vi.fn(async () => undefined),
+      createLogger(config),
+    );
+
+    await watcher.runOnce();
+    expect(getState(setup.database, "gmail_history_id")).toBe("100");
+    expect(getState(setup.database, "gmail_last_success_epoch")).toBe("1999999900");
+
+    await watcher.runOnce();
+    expect(gmail.searchMessageIds).toHaveBeenCalledTimes(2);
+    expect(getState(setup.database, "gmail_history_id")).toBe("200");
+    expect(getState(setup.database, "gmail_last_success_epoch")).toBe("2000000000");
+  });
+
+  it("uses a conservative seven-day catch-up for legacy state", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(2_000_000_000_000);
+    const config = testConfig();
+    const rules = new EmailRuleService(setup.database);
+    setState(setup.database, "gmail_history_id", "100");
+    const gmail = {
+      listNewMessageIds: vi.fn(async () => {
+        throw { response: { status: 404 } };
+      }),
+      getCurrentHistoryId: vi.fn(async () => "200"),
+      searchMessageIds: vi.fn(async () => []),
+    } as unknown as GmailService;
+    const watcher = new EmailWatcher(
+      config,
+      setup.database,
+      gmail,
+      rules,
+      { classify: vi.fn() } as unknown as EmailClassifier,
+      vi.fn(async () => undefined),
+      createLogger(config),
+    );
+
+    await watcher.runOnce();
+
+    expect(gmail.searchMessageIds).toHaveBeenCalledWith(
+      "after:1999395200 -in:sent -in:drafts",
+      Number.POSITIVE_INFINITY,
+      { signal: expect.any(AbortSignal) },
+    );
   });
 
   it("treats a Gmail query as a semantic hint instead of a hard filter", async () => {

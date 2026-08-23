@@ -6,8 +6,29 @@ import type { EmailRuleService } from "./email-rules.js";
 import type { GmailService } from "./gmail.js";
 
 const GMAIL_HISTORY_STATE = "gmail_history_id";
+const GMAIL_LAST_SUCCESS_EPOCH_STATE = "gmail_last_success_epoch";
+const LEGACY_CATCH_UP_SECONDS = 7 * 24 * 60 * 60;
+const NOTIFICATION_TIMEOUT_MS = 30_000;
 
-export type EmailNotifier = (message: string) => Promise<void>;
+export type EmailNotifier = (message: string, signal?: AbortSignal) => Promise<void>;
+
+async function waitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("Operasi dibatalkan."));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 function isExpiredHistory(error: unknown): boolean {
   const candidate = error as { response?: { status?: number } } | null;
@@ -53,6 +74,7 @@ export function emailNotification(
 export class EmailWatcher {
   private timer: NodeJS.Timeout | null = null;
   private currentRun: Promise<void> | null = null;
+  private currentAbortController: AbortController | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -62,6 +84,7 @@ export class EmailWatcher {
     private readonly classifier: EmailClassifier,
     private readonly notifier: EmailNotifier,
     private readonly logger: AppLogger,
+    private readonly notificationTimeoutMs = NOTIFICATION_TIMEOUT_MS,
   ) {}
 
   start(): void {
@@ -82,6 +105,7 @@ export class EmailWatcher {
 
   async stopAndWait(): Promise<void> {
     this.stop();
+    this.currentAbortController?.abort(new Error("Gmail watcher dihentikan."));
     await this.currentRun;
   }
 
@@ -90,153 +114,205 @@ export class EmailWatcher {
       this.logger.warn("Skipping overlapping Gmail poll");
       return;
     }
-    const run = this.poll();
+    const controller = new AbortController();
+    this.currentAbortController = controller;
+    const run = this.poll(controller.signal);
     this.currentRun = run;
     try {
       await run;
     } finally {
       this.currentRun = null;
+      if (this.currentAbortController === controller) {
+        this.currentAbortController = null;
+      }
     }
   }
 
-  private async poll(): Promise<void> {
+  private checkpoint(historyId: string, epoch: number): void {
+    this.database.transaction(() => {
+      setState(this.database, GMAIL_HISTORY_STATE, historyId);
+      setState(this.database, GMAIL_LAST_SUCCESS_EPOCH_STATE, String(epoch));
+    })();
+  }
+
+  private catchUpEpoch(nowEpoch: number): number {
+    const stored = getState(this.database, GMAIL_LAST_SUCCESS_EPOCH_STATE);
+    if (stored) {
+      const epoch = Number(stored);
+      if (Number.isSafeInteger(epoch) && epoch > 0 && epoch <= nowEpoch) return epoch;
+    }
+    return Math.max(0, nowEpoch - LEGACY_CATCH_UP_SECONDS);
+  }
+
+  private async poll(signal: AbortSignal): Promise<void> {
+    const boundaryEpoch = Math.floor(Date.now() / 1000);
     try {
       const startHistoryId = getState(this.database, GMAIL_HISTORY_STATE);
       if (!startHistoryId) {
-        const current = await this.gmail.getCurrentHistoryId();
+        const current = await this.gmail.getCurrentHistoryId({ signal });
         setState(this.database, GMAIL_HISTORY_STATE, current);
-        await this.deliverPendingNotifications();
+        const hasDeliveryFailure = await this.deliverPendingNotifications(signal);
+        if (!hasDeliveryFailure) this.checkpoint(current, boundaryEpoch);
         this.logger.info("Gmail history baseline initialized");
         return;
       }
 
       let batch;
       try {
-        batch = await this.gmail.listNewMessageIds(startHistoryId);
+        batch = await this.gmail.listNewMessageIds(startHistoryId, { signal });
       } catch (error) {
         if (!isExpiredHistory(error)) throw error;
-        const current = await this.gmail.getCurrentHistoryId();
-        setState(this.database, GMAIL_HISTORY_STATE, current);
-        await this.deliverPendingNotifications();
-        this.logger.warn("Gmail history cursor expired; baseline reset without replay");
-        return;
+        const catchUpFromEpoch = this.catchUpEpoch(boundaryEpoch);
+        const current = await this.gmail.getCurrentHistoryId({ signal });
+        const messageIds = await this.gmail.searchMessageIds(
+          `after:${catchUpFromEpoch} -in:sent -in:drafts`,
+          Number.POSITIVE_INFINITY,
+          { signal },
+        );
+        batch = { messageIds, latestHistoryId: current };
+        this.logger.warn(
+          { catchUpFromEpoch, messageCount: messageIds.length },
+          "Gmail history cursor expired; recovering messages with a bounded catch-up",
+        );
       }
 
-      let hasTransientFailure = false;
-      const activeRules = this.rules.list(true);
+      const hasProcessingFailure = await this.processMessages(batch.messageIds, signal);
+      const hasDeliveryFailure = await this.deliverPendingNotifications(signal);
+      if (!hasProcessingFailure && !hasDeliveryFailure) {
+        this.checkpoint(batch.latestHistoryId, boundaryEpoch);
+      }
+    } catch (error) {
+      if (signal.aborted) {
+        this.logger.info("Gmail poll cancelled");
+        return;
+      }
+      this.logger.error({ errorMessage: safeErrorMessage(error) }, "Gmail poll failed");
+    }
+  }
 
-      for (const messageId of batch.messageIds) {
-        let message;
-        const messageFailureKey = `message:${messageId}`;
+  private async processMessages(
+    messageIds: string[],
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    let hasTransientFailure = false;
+    const activeRules = this.rules.list(true);
+
+    for (const messageId of messageIds) {
+      let message;
+      const messageFailureKey = `message:${messageId}`;
+      try {
+        message = await this.gmail.getMessage(messageId, { signal });
+        this.rules.clearProcessingFailure(messageFailureKey);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        const failure = this.rules.recordProcessingFailure(
+          messageFailureKey,
+          messageId,
+          null,
+          "gmail_get_message",
+          safeErrorMessage(error),
+          this.config.EMAIL_MAX_RETRIES,
+        );
+        hasTransientFailure ||= !failure.terminal;
+        this.logger.error(
+          {
+            gmailMessageId: messageId,
+            attempts: failure.attempts,
+            terminal: failure.terminal,
+            errorMessage: safeErrorMessage(error),
+          },
+          failure.terminal
+            ? "Gmail message moved to dead-letter state"
+            : "Gmail message fetch failed; will retry",
+        );
+        continue;
+      }
+
+      for (const rule of activeRules) {
+        if (this.rules.wasEvaluated(rule.id, messageId)) continue;
+        const classificationFailureKey = `classification:${rule.id}:${messageId}`;
         try {
-          message = await this.gmail.getMessage(messageId);
-          this.rules.clearProcessingFailure(messageFailureKey);
-        } catch (error) {
-          const failure = this.rules.recordProcessingFailure(
-            messageFailureKey,
+          const result = await this.classifier.classify(rule, message, signal);
+          this.rules.clearProcessingFailure(classificationFailureKey);
+          const matched = result.match && result.confidence >= this.config.GMAIL_MATCH_THRESHOLD;
+          if (matched) {
+            this.rules.queueNotification(
+              rule.id,
+              messageId,
+              emailNotification(
+                message.from,
+                message.subject,
+                message.date,
+                result.summary,
+                result.reason,
+                result.confidence,
+                message.threadId,
+                rule.description,
+              ),
+            );
+          }
+          this.rules.recordEvaluation(
+            rule.id,
             messageId,
-            null,
-            "gmail_get_message",
+            matched,
+            result.confidence,
+            result.reason,
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          const failure = this.rules.recordProcessingFailure(
+            classificationFailureKey,
+            messageId,
+            rule.id,
+            "semantic_classification",
             safeErrorMessage(error),
             this.config.EMAIL_MAX_RETRIES,
           );
           hasTransientFailure ||= !failure.terminal;
+          if (failure.terminal) {
+            this.rules.recordEvaluation(
+              rule.id,
+              messageId,
+              false,
+              0,
+              `Klasifikasi gagal permanen setelah ${failure.attempts} percobaan.`,
+            );
+          }
           this.logger.error(
             {
+              ruleId: rule.id,
               gmailMessageId: messageId,
               attempts: failure.attempts,
               terminal: failure.terminal,
               errorMessage: safeErrorMessage(error),
             },
             failure.terminal
-              ? "Gmail message moved to dead-letter state"
-              : "Gmail message fetch failed; will retry",
+              ? "Email classification moved to dead-letter state"
+              : "Email classification failed; will retry",
           );
-          continue;
-        }
-
-        for (const rule of activeRules) {
-          if (this.rules.wasEvaluated(rule.id, messageId)) continue;
-          const classificationFailureKey = `classification:${rule.id}:${messageId}`;
-          try {
-            const result = await this.classifier.classify(rule, message);
-            this.rules.clearProcessingFailure(classificationFailureKey);
-            const matched = result.match && result.confidence >= this.config.GMAIL_MATCH_THRESHOLD;
-            if (matched) {
-              this.rules.queueNotification(
-                rule.id,
-                messageId,
-                emailNotification(
-                  message.from,
-                  message.subject,
-                  message.date,
-                  result.summary,
-                  result.reason,
-                  result.confidence,
-                  message.threadId,
-                  rule.description,
-                ),
-              );
-            }
-            this.rules.recordEvaluation(
-              rule.id,
-              messageId,
-              matched,
-              result.confidence,
-              result.reason,
-            );
-          } catch (error) {
-            const failure = this.rules.recordProcessingFailure(
-              classificationFailureKey,
-              messageId,
-              rule.id,
-              "semantic_classification",
-              safeErrorMessage(error),
-              this.config.EMAIL_MAX_RETRIES,
-            );
-            hasTransientFailure ||= !failure.terminal;
-            if (failure.terminal) {
-              this.rules.recordEvaluation(
-                rule.id,
-                messageId,
-                false,
-                0,
-                `Klasifikasi gagal permanen setelah ${failure.attempts} percobaan.`,
-              );
-            }
-            this.logger.error(
-              {
-                ruleId: rule.id,
-                gmailMessageId: messageId,
-                attempts: failure.attempts,
-                terminal: failure.terminal,
-                errorMessage: safeErrorMessage(error),
-              },
-              failure.terminal
-                ? "Email classification moved to dead-letter state"
-                : "Email classification failed; will retry",
-            );
-          }
         }
       }
-
-      hasTransientFailure ||= await this.deliverPendingNotifications();
-      if (!hasTransientFailure) {
-        setState(this.database, GMAIL_HISTORY_STATE, batch.latestHistoryId);
-      }
-    } catch (error) {
-      this.logger.error({ errorMessage: safeErrorMessage(error) }, "Gmail poll failed");
     }
+    return hasTransientFailure;
   }
 
-  private async deliverPendingNotifications(): Promise<boolean> {
+  private async deliverPendingNotifications(signal: AbortSignal): Promise<boolean> {
     let hasTransientFailure = false;
     const pending = this.rules.pendingNotifications(this.config.EMAIL_MAX_RETRIES);
     for (const notification of pending) {
+      signal.throwIfAborted();
+      const deliverySignal = AbortSignal.any([
+        signal,
+        AbortSignal.timeout(this.notificationTimeoutMs),
+      ]);
       try {
-        await this.notifier(notification.messageText);
+        await waitWithSignal(
+          Promise.resolve(this.notifier(notification.messageText, deliverySignal)),
+          deliverySignal,
+        );
         this.rules.markNotificationSent(notification.ruleId, notification.gmailMessageId);
       } catch (error) {
+        if (signal.aborted) throw error;
         const failure = this.rules.recordNotificationFailure(
           notification.ruleId,
           notification.gmailMessageId,

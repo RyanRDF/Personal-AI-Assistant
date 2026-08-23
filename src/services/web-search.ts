@@ -5,7 +5,12 @@ import type { WebSearchResult } from "../types.js";
 export interface WebSearchProvider {
   readonly name: string;
   readonly available: boolean;
-  search(query: string, limit?: number): Promise<WebSearchResult[]>;
+  search(query: string, limit?: number, signal?: AbortSignal): Promise<WebSearchResult[]>;
+}
+
+function searchSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
 const braveResponseSchema = z.object({
@@ -44,7 +49,11 @@ export class BraveSearchProvider implements WebSearchProvider {
     this.available = Boolean(apiKey);
   }
 
-  async search(query: string, limit = this.defaultLimit): Promise<WebSearchResult[]> {
+  async search(
+    query: string,
+    limit = this.defaultLimit,
+    signal?: AbortSignal,
+  ): Promise<WebSearchResult[]> {
     if (!this.apiKey) {
       throw new Error("BRAVE_SEARCH_API_KEY belum dikonfigurasi.");
     }
@@ -58,7 +67,7 @@ export class BraveSearchProvider implements WebSearchProvider {
         Accept: "application/json",
         "X-Subscription-Token": this.apiKey,
       },
-      signal: AbortSignal.timeout(15_000),
+      signal: searchSignal(15_000, signal),
     });
     if (!response.ok) {
       throw new Error(`Brave Search gagal (${response.status}).`);
@@ -82,7 +91,11 @@ export class SearxngSearchProvider implements WebSearchProvider {
     private readonly fetcher: typeof fetch = fetch,
   ) {}
 
-  async search(query: string, limit = this.defaultLimit): Promise<WebSearchResult[]> {
+  async search(
+    query: string,
+    limit = this.defaultLimit,
+    signal?: AbortSignal,
+  ): Promise<WebSearchResult[]> {
     const url = new URL("search", `${this.baseUrl.replace(/\/$/, "")}/`);
     url.searchParams.set("q", query);
     url.searchParams.set("format", "json");
@@ -90,7 +103,7 @@ export class SearxngSearchProvider implements WebSearchProvider {
     url.searchParams.set("safesearch", "1");
     const response = await this.fetcher(url, {
       headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(20_000),
+      signal: searchSignal(20_000, signal),
     });
     if (!response.ok) {
       throw new Error(`SearXNG gagal (${response.status}). Pastikan output JSON diaktifkan.`);

@@ -11,6 +11,7 @@ describe("configuration", () => {
     expect(config.TIMEZONE).toBe("Asia/Jakarta");
     expect(config.OPENAI_MAX_OUTPUT_TOKENS).toBe(2000);
     expect(config.ASSISTANT_TIMEOUT_SECONDS).toBe(90);
+    expect(config.EMAIL_CLASSIFIER_TIMEOUT_SECONDS).toBe(30);
     expect(config.TELEGRAM_IMAGE_MAX_BYTES).toBe(10 * 1024 * 1024);
     expect(config.TRACE_ENABLED_DEFAULT).toBe(false);
     expect(isGmailConfigured(config)).toBe(false);

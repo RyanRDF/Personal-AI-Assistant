@@ -9,6 +9,7 @@ import {
   InvalidVaultOperationError,
   type VaultService,
 } from "../services/vault.js";
+import { observabilitySnapshot, parseObservabilityPeriod } from "./observability.js";
 import { dashboardPage } from "./page.js";
 
 interface DashboardDependencies {
@@ -95,7 +96,7 @@ function statusSnapshot(database: Database.Database, vault: VaultService) {
          (SELECT count(*) FROM memories) AS memories,
          (SELECT count(*) FROM messages) AS messages,
          (SELECT count(*) FROM email_rules WHERE enabled = 1) AS active_email_rules,
-         (SELECT count(*) FROM request_traces WHERE status = 'failed') AS failed_requests`,
+         (SELECT count(*) FROM request_traces WHERE status IN ('failed', 'timeout')) AS failed_requests`,
     )
     .get() as {
       memories: number;
@@ -125,6 +126,18 @@ async function handleApi(
   const { vault, database } = dependencies;
   if (request.method === "GET" && url.pathname === "/api/status") {
     sendJson(response, 200, statusSnapshot(database, vault));
+    return true;
+  }
+  if (request.method === "GET" && url.pathname === "/api/observability") {
+    sendJson(
+      response,
+      200,
+      observabilitySnapshot(
+        database,
+        parseObservabilityPeriod(url.searchParams.get("days")),
+        config.DASHBOARD_TOKEN ?? config.TELEGRAM_BOT_TOKEN,
+      ),
+    );
     return true;
   }
   if (request.method === "GET" && url.pathname === "/api/items") {

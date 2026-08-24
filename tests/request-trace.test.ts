@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { pruneUsageOlderThan, recordUsage } from "../src/db.js";
 import {
   formatRequestTrace,
   RequestTraceService,
@@ -32,6 +33,27 @@ describe("request tracing", () => {
       if (!completed) throw new Error("Trace should have completed");
       expect(formatRequestTrace(completed)).toContain("Gambar siap dianalisis");
       expect(traces.last("owner")?.requestId).toBe(started.requestId);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("prunes usage events using the configured retention window", () => {
+    const { database, cleanup } = temporaryDatabase();
+    try {
+      recordUsage(database, "chat", "gpt-test", 100, 20);
+      database
+        .prepare(
+          `INSERT INTO usage_events(purpose, model, input_tokens, output_tokens, created_at)
+           VALUES ('chat', 'gpt-test', 10, 2, datetime('now', '-91 days'))`,
+        )
+        .run();
+
+      expect(pruneUsageOlderThan(database, 90)).toBe(1);
+      expect(
+        (database.prepare("SELECT count(*) AS count FROM usage_events").get() as { count: number })
+          .count,
+      ).toBe(1);
     } finally {
       cleanup();
     }

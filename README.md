@@ -390,7 +390,12 @@ Contoh alur:
 
 Nama item harus unik di folder yang sama tanpa membedakan huruf besar/kecil. Bila nama sudah ada, bot/dashboard menolak upload dan menunjukkan item konflik; file lama tidak ditimpa diam-diam.
 
-Jalankan aplikasi, lalu buka `http://127.0.0.1:3030`. Dashboard menyediakan navigasi folder, pencarian nama/isi catatan, upload/download, catatan baru, rename, move, delete dengan konfirmasi, dan ringkasan status aplikasi. Untuk Docker/cloud, isi `DASHBOARD_TOKEN`; browser meminta Basic Auth (username bebas, password adalah token tersebut).
+Jalankan aplikasi, lalu buka `http://127.0.0.1:3030`. Dashboard menyediakan dua ruang kerja:
+
+- **Vault** untuk navigasi folder, pencarian nama/isi catatan, upload/download, catatan baru, rename, move, dan delete dengan konfirmasi.
+- **Status aplikasi** untuk grafik volume request dan token, token input/output per chat, success rate, latensi rata-rata dan P95, status request, uptime, penggunaan memori proses, ukuran database, model/purpose usage, tool usage, resource count, serta 50 trace terbaru. Rentang waktu dapat diubah ke 24 jam, 7 hari, 30 hari, atau 90 hari dan diperbarui otomatis setiap 30 detik.
+
+Status aplikasi membaca data nyata dari `request_traces` dan `usage_events`, tidak menampilkan isi percakapan, serta mengubah setiap Telegram chat ID menjadi pseudonim stabil. Trace dan usage event lama dibersihkan mengikuti `MESSAGE_RETENTION_DAYS`. Untuk Docker/cloud, isi `DASHBOARD_TOKEN`; browser meminta Basic Auth (username bebas, password adalah token tersebut).
 
 ## Analisis gambar dan trace
 

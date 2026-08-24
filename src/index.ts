@@ -3,7 +3,7 @@ import { run } from "@grammyjs/runner";
 import { EmailClassifier } from "./ai/email-classifier.js";
 import { PersonalAssistant } from "./ai/assistant.js";
 import { isGmailConfigured, loadConfig } from "./config.js";
-import { openDatabase } from "./db.js";
+import { openDatabase, pruneUsageOlderThan } from "./db.js";
 import { createLogger } from "./logger.js";
 import { startDashboard, stopDashboard } from "./dashboard/server.js";
 import { ConversationService } from "./services/conversation.js";
@@ -36,6 +36,7 @@ async function main(): Promise<void> {
   const vault = new VaultService(database, config.VAULT_STORAGE_PATH);
   const traces = new RequestTraceService(database, config.TRACE_ENABLED_DEFAULT);
   traces.pruneOlderThan(config.MESSAGE_RETENTION_DAYS);
+  pruneUsageOlderThan(database, config.MESSAGE_RETENTION_DAYS);
   const emailRules = new EmailRuleService(database);
   const search = createSearchProvider(config);
   const gmailConfigured = isGmailConfigured(config);

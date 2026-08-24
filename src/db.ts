@@ -125,6 +125,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
   output_tokens INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE INDEX IF NOT EXISTS idx_usage_events_created
+  ON usage_events(created_at);
 
 CREATE TABLE IF NOT EXISTS request_traces (
   request_id TEXT PRIMARY KEY,
@@ -143,6 +145,8 @@ CREATE TABLE IF NOT EXISTS request_traces (
 );
 CREATE INDEX IF NOT EXISTS idx_request_traces_chat_started
   ON request_traces(chat_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_request_traces_started
+  ON request_traces(started_at DESC);
 `;
 
 export function openDatabase(databasePath: string, logger?: AppLogger): Database.Database {
@@ -184,4 +188,10 @@ export function recordUsage(
       "INSERT INTO usage_events(purpose, model, input_tokens, output_tokens) VALUES (?, ?, ?, ?)",
     )
     .run(purpose, model, inputTokens, outputTokens);
+}
+
+export function pruneUsageOlderThan(database: Database.Database, days: number): number {
+  return database
+    .prepare("DELETE FROM usage_events WHERE created_at < datetime('now', ?)")
+    .run(`-${days} days`).changes;
 }

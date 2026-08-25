@@ -12,6 +12,7 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().trim().min(1),
   OPENAI_CHAT_MODEL: z.string().trim().min(1).default("gpt-4o-mini"),
   OPENAI_CLASSIFIER_MODEL: z.string().trim().min(1).default("gpt-4o-mini"),
+  OPENAI_TRANSCRIPTION_MODEL: z.string().trim().min(1).default("gpt-4o-mini-transcribe"),
   OPENAI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(128).max(16_384).default(2000),
   ASSISTANT_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(600).default(90),
   TELEGRAM_IMAGE_MAX_BYTES: z.coerce
@@ -28,7 +29,26 @@ const envSchema = z.object({
     .transform((value) => value === "true"),
   DATABASE_PATH: z.string().trim().min(1).default("./data/assistant.sqlite"),
   VAULT_STORAGE_PATH: z.string().trim().min(1).default("./data/vault"),
+  VAULT_STORAGE_BACKEND: z.enum(["local", "s3"]).default("local"),
+  VAULT_OBJECT_PREFIX: z.string().trim().min(1).default("approved/"),
+  S3_BUCKET: optionalTrimmedString,
+  S3_ENDPOINT: optionalTrimmedString.pipe(z.string().url().optional()),
+  S3_REGION: z.string().trim().min(1).default("auto"),
+  S3_ACCESS_KEY_ID: optionalTrimmedString,
+  S3_SECRET_ACCESS_KEY: optionalTrimmedString,
+  S3_FORCE_PATH_STYLE: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
   VAULT_MAX_FILE_BYTES: z.coerce.number().int().min(1024).max(20 * 1024 * 1024).default(20 * 1024 * 1024),
+  ATTACHMENT_ANALYSIS_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  ATTACHMENT_PROCESSING_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(600).default(120),
+  VIDEO_MAX_DURATION_SECONDS: z.coerce.number().int().min(1).max(600).default(120),
+  VIDEO_MAX_FRAMES: z.coerce.number().int().min(1).max(12).default(6),
+  FFMPEG_PATH: z.string().trim().min(1).default("ffmpeg"),
   MAX_VAULT_CONTEXT_ITEMS: z.coerce.number().int().min(1).max(50).default(12),
   DASHBOARD_ENABLED: z
     .enum(["true", "false"])
@@ -57,6 +77,22 @@ const envSchema = z.object({
   BRAVE_SEARCH_API_KEY: optionalTrimmedString,
   SEARXNG_BASE_URL: z.string().url().default("http://localhost:8080"),
   SEARCH_RESULT_LIMIT: z.coerce.number().int().min(1).max(10).default(5),
+}).superRefine((config, context) => {
+  if (config.VAULT_STORAGE_BACKEND !== "s3") return;
+  for (const key of [
+    "S3_BUCKET",
+    "S3_ENDPOINT",
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+  ] as const) {
+    if (!config[key]) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [key],
+        message: `${key} wajib diisi ketika VAULT_STORAGE_BACKEND=s3`,
+      });
+    }
+  }
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

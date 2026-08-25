@@ -287,6 +287,130 @@ describe("Telegram safety and formatting", () => {
     expect(sendMessageCount).toBe(2);
   });
 
+  it("stores and responds to a captioned video instead of silently dropping it", async () => {
+    const assistantReply = vi.fn().mockResolvedValue("Saya berhasil membaca video servis.");
+    const saveFileObject = vi.fn().mockResolvedValue({
+      id: 12,
+      parentId: null,
+      kind: "file",
+      name: "Video Telegram 100.mp4",
+      mimeType: "video/mp4",
+      detectedMimeType: "video/mp4",
+      mediaKind: "video",
+      sizeBytes: 24,
+      storageKey: "11111111-1111-4111-8111-111111111111",
+      storageBackend: "s3",
+      sourceFileUniqueId: "video-unique",
+      sourceCaption: "Simpan video ini ke Vault sebagai bukti servis motor seharga 1.2jt",
+      content: null,
+      sha256: "0".repeat(64),
+      sourceChatId: "123456",
+      sourceMessageId: "100",
+      createdAt: "2026-08-25 00:00:00",
+      updatedAt: "2026-08-25 00:00:00",
+    });
+    const trace = {
+      requestId: "video123-request",
+      chatId: "123456",
+      model: "test-model",
+      inputKind: "image" as const,
+      startedAt: Date.now(),
+      stages: [],
+      tools: [],
+      inputTokens: 0,
+      outputTokens: 0,
+    };
+    const bot = createTelegramBot(
+      testConfig({ ATTACHMENT_ANALYSIS_ENABLED: "false" }),
+      createLogger({ LOG_LEVEL: "silent" }),
+      {
+        assistant: { openaiClient: {}, reply: assistantReply },
+        conversations: {},
+        memories: {},
+        vault: {
+          findDuplicateName: vi.fn(() => null),
+          saveFileObject,
+          pathFor: vi.fn(() => "/Video Telegram 100.mp4"),
+        },
+        emailRules: {},
+        search: { available: false, name: "none" },
+        traces: {
+          start: vi.fn(() => trace),
+          isLiveEnabled: vi.fn(() => false),
+          addStage: vi.fn(),
+          addTool: vi.fn(),
+          addUsage: vi.fn(),
+          finish: vi.fn(() => trace),
+        },
+        telegramHistory: { record: vi.fn() },
+        gmailConfigured: false,
+      } as never,
+    );
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: "Test",
+      username: "test_bot",
+    } as never;
+    const mp4 = Uint8Array.from([
+      0, 0, 0, 24, 102, 116, 121, 112, 105, 115, 111, 109,
+      0, 0, 0, 0, 105, 115, 111, 109, 109, 112, 52, 50,
+    ]);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(mp4, {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": String(mp4.byteLength) },
+    })));
+    let messageId = 200;
+    bot.api.config.use(async (_previous, method) => {
+      if (method === "getFile") {
+        return { ok: true, result: { file_id: "video-file", file_unique_id: "video-unique", file_size: mp4.byteLength, file_path: "video.mp4" } } as never;
+      }
+      if (method === "sendChatAction") return { ok: true, result: true } as never;
+      messageId += 1;
+      return {
+        ok: true,
+        result: {
+          message_id: messageId,
+          date: 1_700_000_000,
+          chat: { id: 123456, type: "private" },
+          text: "ok",
+        },
+      } as never;
+    });
+
+    await bot.handleUpdate({
+      update_id: 10,
+      message: {
+        message_id: 100,
+        date: 1_700_000_000,
+        chat: { id: 123456, type: "private", first_name: "Owner" },
+        from: { id: 123456, is_bot: false, first_name: "Owner" },
+        video: {
+          file_id: "video-file",
+          file_unique_id: "video-unique",
+          width: 720,
+          height: 1280,
+          duration: 7,
+          file_size: mp4.byteLength,
+          mime_type: "video/mp4",
+        },
+        caption: "Simpan video ini ke Vault sebagai bukti servis motor seharga 1.2jt",
+      },
+    });
+
+    expect(saveFileObject).toHaveBeenCalledOnce();
+    expect(assistantReply).toHaveBeenCalledWith(
+      "123456",
+      expect.objectContaining({
+        text: "Simpan video ini ke Vault sebagai bukti servis motor seharga 1.2jt",
+        attachmentContext: expect.objectContaining({
+          vault: expect.objectContaining({ saved: true, id: 12, backend: "s3" }),
+        }),
+      }),
+      expect.any(Object),
+    );
+  });
+
   it("propagates deadline signals through assistant replies, typing, edits, chunks, and files", async () => {
     const calls: Array<{ method: string; signal: unknown }> = [];
     const trace = {

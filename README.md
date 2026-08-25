@@ -5,8 +5,9 @@ Asisten AI personal berbasis Telegram untuk satu pemilik. Aplikasi dapat mengobr
 ## Fitur
 
 - Telegram long polling: tidak membutuhkan domain publik atau webhook.
-- Analisis gambar Telegram (foto maupun dokumen JPEG/PNG/WebP/GIF) dengan input vision OpenAI.
-- Foto tanpa caption disimpan hanya di memori selama 10 menit untuk pertanyaan teks berikutnya.
+- Penyimpanan dan analisis attachment Telegram: foto, dokumen, video, animation, audio, voice, video note, dan sticker.
+- Railway Bucket private sebagai backend byte file opsional; SQLite dan metadata tetap persisten di Volume.
+- Dokumen memakai OpenAI file input, audio ditranskripsikan, dan video dianalisis melalui frame/audio yang diekstrak FFmpeg.
 - Streaming preview, indikator proses berkala, timeout, pembatalan, dan trace operasional.
 - Owner-only dan private-chat-only melalui `TELEGRAM_ALLOWED_USER_ID`.
 - Model dapat diganti lewat `.env`; default ekonomis `gpt-4o-mini`.
@@ -28,7 +29,7 @@ Telegram (owner only)
 PersonalAssistant ── OpenAI tool calling
         │
         ├── SQLite memory + conversation
-        ├── SQLite vault metadata + data/vault files
+        ├── SQLite vault metadata + local Volume atau Railway Bucket
         ├── Gmail search
         ├── Email watch rules
         └── Brave Search / SearXNG
@@ -47,6 +48,7 @@ Detail desain ada di [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Perbandingan 
 - Telegram bot token dari `@BotFather`.
 - Numeric Telegram user ID pemilik, misalnya dari `@userinfobot`.
 - OpenAI API key.
+- FFmpeg pada `PATH` bila menjalankan langsung tanpa Docker dan ingin analisis video.
 - Opsional: Google OAuth client untuk Gmail.
 - Opsional: Brave Search API key atau Docker untuk SearXNG.
 - Untuk deployment lokal/VPS: Docker Engine/Desktop dengan Docker Compose v2.
@@ -178,6 +180,7 @@ Salin `.env.example` menjadi `.env`, lalu ubah hanya nilai yang diperlukan. Nila
 | `OPENAI_API_KEY` | Ya | Project secret key dari OpenAI API Platform |
 | `OPENAI_CHAT_MODEL` | Tidak | Model chat/vision; default `gpt-4o-mini` |
 | `OPENAI_CLASSIFIER_MODEL` | Tidak | Model klasifikasi email; default `gpt-4o-mini` |
+| `OPENAI_TRANSCRIPTION_MODEL` | Tidak | Model transkripsi audio; default `gpt-4o-mini-transcribe` |
 | `OPENAI_MAX_OUTPUT_TOKENS` | Tidak | Maksimum output; default `2000` |
 | `ASSISTANT_TIMEOUT_SECONDS` | Tidak | Timeout satu request; default `90` detik |
 | `TELEGRAM_IMAGE_MAX_BYTES` | Tidak | Maksimum ukuran gambar; default `10485760` (10 MiB) |
@@ -186,7 +189,15 @@ Salin `.env.example` menjadi `.env`, lalu ubah hanya nilai yang diperlukan. Nila
 | `TRACE_ENABLED_DEFAULT` | Tidak | `true`/`false`; dapat diubah per chat melalui `/trace` |
 | `DATABASE_PATH` | Tidak | SQLite lokal; default `./data/assistant.sqlite` |
 | `VAULT_STORAGE_PATH` | Tidak | Direktori byte file vault; default `./data/vault` |
+| `VAULT_STORAGE_BACKEND` | Tidak | `local` atau `s3`; default `local` |
+| `VAULT_OBJECT_PREFIX` | Tidak | Prefix object private; default `approved/` |
+| `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION` | Wajib untuk S3 | Reference ke credential Railway Bucket |
+| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | Wajib untuk S3 | Reference secret Railway Bucket; jangan commit |
+| `S3_FORCE_PATH_STYLE` | Tidak | Default `false`; ikuti tab Credentials Bucket |
 | `VAULT_MAX_FILE_BYTES` | Tidak | Batas satu file; default/maksimum `20971520` (20 MiB) |
+| `ATTACHMENT_ANALYSIS_ENABLED` | Tidak | Aktifkan analisis dokumen/media; default `true` |
+| `VIDEO_MAX_DURATION_SECONDS` | Tidak | Durasi video maksimal yang dianalisis; default `120` |
+| `VIDEO_MAX_FRAMES` | Tidak | Frame video maksimal; default `6` |
 | `MAX_VAULT_CONTEXT_ITEMS` | Tidak | Maksimum item vault relevan dalam konteks AI; default `12` |
 | `DASHBOARD_ENABLED` | Tidak | Jalankan dashboard dan `/health`; default `true` |
 | `DASHBOARD_HOST` | Tidak | Default `127.0.0.1`; cloud/container memakai `0.0.0.0` dengan token |
@@ -369,7 +380,7 @@ Memori memakai pencarian lexical lokal agar tidak membutuhkan embedding API dan 
 
 ## Vault dan dashboard
 
-Forward chat atau dokumen non-gambar ke bot untuk menyimpannya langsung. Foto dan dokumen gambar hanya masuk vault bila merupakan forward atau memakai caption `/save [folder]`; selain itu alur analisis gambar tetap berlaku. Untuk menyimpan chat yang sudah ada, reply pesan tersebut dengan `/save [judul] | [folder opsional]`.
+Attachment pemilik disimpan ke Vault sebelum dianalisis. Foto tanpa caption tetap menunggu pertanyaan berikutnya, tetapi byte sudah tersimpan persisten. Caption dan source ID disimpan sebagai metadata agar file dapat dicari kembali. `/save [folder]` tetap tersedia untuk menyimpan tanpa analisis ke folder tertentu.
 
 Bot dapat membaca kembali isi note apa pun yang diminta pemilik, termasuk credential pribadi yang sengaja disimpan sendiri, misalnya `Tampilkan akun dan password dashboard Railway yang saya simpan`. Akses ini hanya bekerja dari private chat dengan `TELEGRAM_ALLOWED_USER_ID`; secret runtime aplikasi seperti API key, token bot, environment variable, dan isi log tetap tidak dapat diambil. Karena hasilnya terlihat di riwayat Telegram, hapus pesan setelah digunakan atau jalankan `/clear_chat CONFIRM` bila sesuai.
 
@@ -397,14 +408,14 @@ Jalankan aplikasi, lalu buka `http://127.0.0.1:3030`. Dashboard menyediakan dua 
 
 Status aplikasi membaca data nyata dari `request_traces` dan `usage_events`, tidak menampilkan isi percakapan, serta mengubah setiap Telegram chat ID menjadi pseudonim stabil. Trace dan usage event lama dibersihkan mengikuti `MESSAGE_RETENTION_DAYS`. Untuk Docker/cloud, isi `DASHBOARD_TOKEN`; browser meminta Basic Auth (username bebas, password adalah token tersebut).
 
-## Analisis gambar dan trace
+## Analisis attachment dan trace
 
 Ada dua cara mengirim gambar:
 
 1. Kirim foto dengan caption pertanyaan; bot langsung menganalisisnya.
 2. Kirim foto tanpa caption; setelah bot mengonfirmasi penerimaan, kirim pertanyaan teks dalam 10 menit.
 
-Bot mengambil resolusi foto Telegram terbesar dan mengirim gambar sebagai data URL ke model vision. URL unduhan Telegram yang mengandung bot token tidak ditulis ke log. Gambar mentah tidak disimpan ke SQLite; riwayat hanya menyimpan caption dan penanda bahwa sebuah gambar pernah dilampirkan.
+Bot mengambil resolusi foto terbesar. Dokumen yang didukung dikirim sebagai file input, audio ditranskripsikan, dan video diproses menjadi maksimal sejumlah frame serta audio melalui FFmpeg. URL unduhan Telegram yang mengandung bot token tidak ditulis ke log. Byte mentah disimpan di backend Vault, bukan SQLite; riwayat chat hanya menyimpan caption dan marker attachment.
 
 Gunakan `/trace on` untuk menampilkan tahapan, tool, durasi, model, dan penggunaan token. `/last_trace` selalu dapat menampilkan trace teknis terakhir. Trace adalah observabilitas operasional, bukan chain-of-thought internal model. Gunakan `/cancel` untuk membatalkan request aktif. Bot memakai runner concurrent agar perintah pembatalan tetap dapat diproses ketika model sedang bekerja, sementara request AI tetap dibatasi satu per chat.
 
@@ -430,7 +441,7 @@ Lanjutkan dengan uji fungsional lokal:
 1. Jalankan `npm run dev`.
 2. Kirim `/status` untuk melihat konfigurasi model, Gmail, search, outbox, dan database.
 3. Kirim `Balas dengan kata: berhasil` untuk menguji panggilan OpenAI sebenarnya.
-4. Kirim gambar dengan caption pertanyaan untuk menguji vision.
+4. Kirim gambar dan video pendek dengan caption pertanyaan untuk menguji pipeline media.
 5. Aktifkan `/trace on`, kirim pertanyaan, lalu periksa `/last_trace`.
 6. Bila Gmail aktif, coba `Cari email terbaru dari Google` dan buat satu aturan watch percobaan.
 7. Bila search aktif, coba `Cari berita teknologi terbaru dan sertakan sumber`.
@@ -441,7 +452,7 @@ Lanjutkan dengan uji fungsional lokal:
 
 ### Pilihan A — Railway + persistent volume (direkomendasikan untuk 24/7)
 
-Repository sudah menyertakan `railway.json`, healthcheck `/health`, restart policy, dan Dockerfile. Endpoint `/health` sengaja hanya mengembalikan `{ "ok": true }`; statistik rinci tetap tersedia melalui `/api/status` yang terautentikasi. Buat satu service dari GitHub, pasang volume pada `/app/data`, gunakan tepat satu replica, lalu set `DATABASE_PATH=/app/data/assistant.sqlite`, `VAULT_STORAGE_PATH=/app/data/vault`, `DASHBOARD_HOST=0.0.0.0`, `DASHBOARD_TOKEN`, dan `RAILWAY_RUN_UID=0`. Railway akan menginjeksi `PORT`.
+Repository sudah menyertakan `railway.json`, healthcheck `/health`, restart policy, dan Dockerfile. Buat satu service dari GitHub, pasang Volume pada `/app/data`, dan gunakan tepat satu replica. SQLite tetap membutuhkan Volume. Untuk byte file baru, tambahkan private Railway Bucket lalu referensikan credential `BUCKET`, `ENDPOINT`, `REGION`, `ACCESS_KEY_ID`, dan `SECRET_ACCESS_KEY` ke variable `S3_*`; lihat panduan deployment sebelum mengaktifkan `VAULT_STORAGE_BACKEND=s3`.
 
 Panduan lengkap, topologi, daftar variable, backup/restore, dan alternatif Fly.io ada di [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
@@ -537,11 +548,12 @@ sudo journalctl -u personal-ai-assistant -f
 
 ### Data persisten dan backup
 
-SQLite, memori, aturan email, cursor/checkpoint Gmail, trace, journal recovery vault, dan seluruh byte file vault tersimpan pada `./data`. Operasi file vault memakai staging/trash yang direkonsiliasi saat startup, tetapi backup tetap harus mencakup database dan direktori vault sebagai satu kesatuan. Untuk backup yang konsisten:
+SQLite, memori, aturan email, cursor/checkpoint Gmail, trace, journal recovery vault, dan file Vault lokal tersimpan pada `./data`. Bila `VAULT_STORAGE_BACKEND=s3`, file baru berada di Bucket sementara metadata dan file legacy tetap berada di Volume. Operasi lokal memakai staging/trash dan operasi S3 memakai journal yang direkonsiliasi saat startup. Untuk backup yang konsisten:
 
 1. Hentikan proses/container assistant.
 2. Salin seluruh folder `data` ke lokasi backup yang terenkripsi atau aksesnya terbatas.
-3. Jalankan kembali assistant.
+3. Bila Bucket aktif, cadangkan seluruh object Bucket dan pertahankan credential untuk memulihkan file S3 lama.
+4. Jalankan kembali assistant.
 
 File `.env` juga perlu dicadangkan secara aman, terpisah dari Git. Jangan menaruhnya di image Docker, repository, chat, atau issue tracker.
 
@@ -551,7 +563,7 @@ File `.env` juga perlu dicadangkan secara aman, terpisah dari Git. Jangan menaru
 - Token/key yang pernah tampil di chat, screenshot, atau commit sudah dirotasi.
 - Hanya satu proses bot berjalan untuk token tersebut.
 - Folder `data` persisten dan mempunyai backup.
-- Database dan folder `data/vault` selalu dibackup/dipulihkan sebagai satu kesatuan.
+- Database, folder `data/vault`, dan object Bucket selalu dibackup/dipulihkan sebagai satu kesatuan.
 - `/status` tidak menunjukkan konfigurasi wajib yang hilang atau dead-letter Gmail.
 - Chat teks, gambar, dan `/last_trace` berhasil.
 - Gmail search/watch berhasil bila diaktifkan.
@@ -602,14 +614,14 @@ Selain perintah tersebut, gunakan bahasa natural untuk bertanya, menerjemahkan, 
 
 - Bot menolak semua user selain ID pemilik dan menolak group chat.
 - Gmail memakai read-only scope.
-- Email, hasil web, isi vault, dan teks di dalam gambar diperlakukan sebagai untrusted data dalam prompt.
+- Email, hasil web, isi vault, OCR, dokumen, transkrip, dan frame video diperlakukan sebagai untrusted data dalam prompt.
 - Pencarian dan konteks otomatis vault hanya mengirim metadata. Isi note penuh hanya dimuat setelah permintaan eksplisit; tool jaringan dinonaktifkan pada turn yang membaca note sensitif.
 - Tool yang mengubah memori atau aturan hanya tersedia bila klausa awal pesan pemilik secara eksplisit meminta aksi tersebut; penghapusan hanya melalui command deterministik.
 - Subject/body email tidak ditulis ke log aplikasi.
-- Riwayat, memori, dan seluruh isi vault tersimpan dalam bentuk plaintext; lindungi folder/volume `data`, backup, serta dashboard.
+- Riwayat, memori, dan isi vault dapat memuat data sensitif; lindungi Volume `data`, Bucket, credential, backup, serta dashboard.
 - Dashboard tanpa token hanya diizinkan pada loopback. Bind jaringan/cloud gagal saat startup bila `DASHBOARD_TOKEN` kosong.
-- Gambar dikirim ke OpenAI untuk dianalisis, tetapi gambar mentah tidak disimpan ke database atau log aplikasi.
-- Foto tanpa caption berada sementara di RAM dan kedaluwarsa otomatis; restart proses juga langsung membuangnya.
+- Attachment yang didukung dikirim ke OpenAI untuk dianalisis; byte mentah tidak disimpan ke database atau log aplikasi.
+- Attachment disimpan dengan object key UUID. Executable/script dan archive generik ditolak; format yang belum dapat dianalisis tidak dieksekusi.
 - Tool yang tersedia tidak dapat mengirim email, menghapus email, menjalankan shell, atau melakukan transaksi.
 - SQLite cocok untuk satu proses personal. Jangan menjalankan beberapa replica bot terhadap volume database yang sama.
 - Pencocokan email memakai model probabilistik. Sesuaikan `GMAIL_MATCH_THRESHOLD` jika notifikasi terlalu banyak atau terlalu sedikit.

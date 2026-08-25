@@ -1,6 +1,6 @@
 # Deployment 24/7
 
-## Rekomendasi: Railway + persistent volume
+## Rekomendasi: Railway Volume + optional private Bucket
 
 Railway adalah jalur paling ringkas untuk aplikasi ini karena repository sudah memiliki Dockerfile, endpoint health, restart policy, dashboard HTTP, dan satu direktori data persisten. Bot harus selalu menyala karena Telegram long polling dan Gmail watcher berjalan di background; jangan aktifkan mode sleep/serverless.
 
@@ -18,9 +18,9 @@ Internet
        bot + watcher + dashboard
              │
              ▼
-       volume /app/data
-       ├── assistant.sqlite
-       └── vault/<storage-key>
+       volume /app/data                  private Railway Bucket (opsional)
+       ├── assistant.sqlite              └── approved/<UUID> byte file baru
+       └── vault/<UUID> file lokal lama
 ```
 
 Gunakan tepat **satu replica**. SQLite dan volume file bersifat single-writer, sedangkan dua proses long polling dengan token Telegram yang sama akan berebut update.
@@ -52,6 +52,32 @@ RAILWAY_RUN_UID=0
 # Railway menginjeksi PORT; jangan hardcode variable ini di dashboard Railway.
 ```
 
+### Menyimpan byte Vault di Railway Bucket
+
+Volume `/app/data` tetap wajib karena SQLite, memori, dan metadata Vault tidak dipindahkan ke Bucket. Untuk mengarahkan **file baru** ke Bucket:
+
+1. Tambahkan Railway Bucket pada environment produksi yang sama.
+2. Pada Variables service aplikasi, buat reference dari credential Bucket ke variable aplikasi berikut—jangan salin credential ke repository:
+
+```dotenv
+VAULT_STORAGE_BACKEND=s3
+VAULT_OBJECT_PREFIX=approved/
+S3_BUCKET=<reference ke BUCKET>
+S3_ENDPOINT=<reference ke ENDPOINT>
+S3_REGION=<reference ke REGION>
+S3_ACCESS_KEY_ID=<reference ke ACCESS_KEY_ID>
+S3_SECRET_ACCESS_KEY=<reference ke SECRET_ACCESS_KEY>
+S3_FORCE_PATH_STYLE=false
+```
+
+Gunakan credential `BUCKET`, bukan `RAILWAY_BUCKET_NAME`. Bucket baru Railway umumnya memakai virtual-hosted style sehingga `S3_FORCE_PATH_STYLE=false`; ikuti tab Credentials bila bucket lama menunjukkan konfigurasi berbeda.
+
+Schema menyimpan `storage_backend` per item. Karena itu file lokal lama tetap dibaca dari Volume setelah backend default berubah ke S3, tetapi **tidak otomatis dimigrasikan**. Jika penulisan dikembalikan ke `local`, pertahankan seluruh variable `S3_*` agar file S3 lama tetap dapat dibaca dan dihapus. Jangan menghapus `VAULT_STORAGE_PATH` atau Volume. Backup juga harus mencakup Volume dan Bucket; Railway Bucket belum menyediakan object versioning/lifecycle, sehingga retensi dan salinan offsite perlu diatur terpisah.
+
+Railway Bucket tidak menaikkan batas Telegram. Hosted Bot API hanya mengizinkan bot mengunduh file sampai 20 MB; file lebih besar memerlukan Telegram Local Bot API Server sebagai service terpisah.
+
+Referensi: [Railway Storage Buckets](https://docs.railway.com/storage-buckets), [Railway Bucket guide](https://docs.railway.com/guides/storage-buckets-guide), dan [Telegram getFile](https://core.telegram.org/bots/api#getfile).
+
 Untuk pencarian web, Brave lebih sederhana pada satu-service deployment. Jika tetap memakai SearXNG, deploy sebagai service kedua di private network dan arahkan `SEARXNG_BASE_URL` ke alamat internal service tersebut.
 
 Referensi resmi:
@@ -63,7 +89,7 @@ Referensi resmi:
 
 ## Rencana backup dan pemulihan
 
-Data yang harus dipertahankan adalah seluruh `/app/data`, bukan hanya SQLite. Metadata file berada di `assistant.sqlite`, sedangkan byte file berada di `vault/`; memulihkan salah satunya saja menghasilkan item yatim.
+Data yang harus dipertahankan adalah seluruh `/app/data`, bukan hanya SQLite. Pada backend lokal, byte file berada di `vault/`; pada backend S3, byte file baru berada di Bucket. Pemulihan harus memasangkan snapshot SQLite dengan byte dari kedua backend agar tidak menghasilkan item yatim.
 
 - Harian: snapshot volume otomatis.
 - Mingguan: snapshot dengan retensi lebih panjang.

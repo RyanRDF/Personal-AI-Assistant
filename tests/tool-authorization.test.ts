@@ -27,6 +27,12 @@ describe("assistant tool authorization", () => {
     expect(tools.has("return_vault_file")).toBe(true);
   });
 
+  it("authorizes a real downloadable CSV for the reported conversation wording", () => {
+    const tools = allowed("Buat CSV terus simpan di vault");
+    expect(tools.has("create_vault_text_file")).toBe(true);
+    expect(tools.has("write_vault_note")).toBe(false);
+  });
+
   it("allows memory mutation only for an explicit owner request", () => {
     const tools = allowed("Tolong ingat bahwa saya lebih suka jawaban singkat.");
     expect(tools.has("remember")).toBe(true);

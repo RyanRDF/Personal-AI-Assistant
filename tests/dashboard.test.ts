@@ -73,6 +73,26 @@ describe("vault dashboard", () => {
     expect(status.vault).toMatchObject({ files: 1, folders: 2 });
   });
 
+  it("rejects an executable disguised as a dashboard document", async () => {
+    const executable = Buffer.alloc(256);
+    executable.write("MZ", 0, "ascii");
+    executable.writeUInt32LE(128, 0x3c);
+    executable.write("PE\0\0", 128, "binary");
+
+    const response = await fetch(`${baseUrl}/api/files`, {
+      method: "POST",
+      headers: {
+        authorization,
+        "content-type": "application/pdf",
+        "x-file-name": encodeURIComponent("invoice.pdf"),
+      },
+      body: executable,
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toMatch(/executable/iu);
+  });
+
   it("reports token, reliability, latency, and pseudonymous chat observability", async () => {
     const traces = new RequestTraceService(setup.database);
     const completed = traces.start("private-telegram-chat", "gpt-test", "text");

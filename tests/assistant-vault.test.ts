@@ -638,4 +638,72 @@ describe("assistant vault tools", () => {
       setup.cleanup();
     }
   });
+
+  it("creates a real CSV file and queues it for Telegram", async () => {
+    const setup = temporaryDatabase();
+    try {
+      const config = testConfig();
+      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const csv = "tanggal,kategori,jumlah\n2026-08-25,Servis,1200000";
+      const create = vi
+        .fn()
+        .mockResolvedValueOnce(
+          fakeStream([
+            {
+              choices: [{
+                delta: {
+                  tool_calls: [{
+                    index: 0,
+                    id: "call-create-csv",
+                    function: {
+                      name: "create_vault_text_file",
+                      arguments: JSON.stringify({
+                        name: "Pengeluaran-2026-08",
+                        content: csv,
+                        format: "csv",
+                        folder: null,
+                      }),
+                    },
+                  }],
+                },
+              }],
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          fakeStream([{ choices: [{ delta: { content: "CSV sudah disimpan dan dikirim." } }] }]),
+        );
+      const client = { chat: { completions: { create } } } as unknown as OpenAI;
+      const events: AssistantEvent[] = [];
+      const assistant = new PersonalAssistant(
+        config,
+        setup.database,
+        createLogger(config),
+        {
+          conversations: new ConversationService(setup.database),
+          memories: new MemoryService(setup.database),
+          vault,
+          emailRules: new EmailRuleService(setup.database),
+          gmail: null,
+          search: { name: "test", available: false, async search() { return []; } },
+        },
+        client,
+      );
+
+      await expect(
+        assistant.reply("123456", "Buat CSV terus simpan di vault", {
+          onEvent: (event) => events.push(event),
+        }),
+      ).resolves.toBe("CSV sudah disimpan dan dikirim.");
+
+      const item = vault.list()[0]!;
+      expect(item.kind).toBe("file");
+      expect(item.name).toBe("Pengeluaran-2026-08.csv");
+      expect(item.mimeType).toContain("text/csv");
+      expect(Buffer.from(await vault.fileBytes(item.id))).toEqual(Buffer.from(csv));
+      expect(events).toContainEqual({ type: "file", itemId: item.id });
+    } finally {
+      setup.cleanup();
+    }
+  });
 });

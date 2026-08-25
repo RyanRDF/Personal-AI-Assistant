@@ -42,6 +42,11 @@ CREATE TABLE IF NOT EXISTS vault_items (
   mime_type TEXT,
   size_bytes INTEGER NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
   storage_key TEXT,
+  storage_backend TEXT NOT NULL DEFAULT 'local' CHECK (storage_backend IN ('local', 's3')),
+  detected_mime_type TEXT,
+  media_kind TEXT,
+  source_file_unique_id TEXT,
+  source_caption TEXT,
   content TEXT,
   sha256 TEXT,
   source_chat_id TEXT,
@@ -69,6 +74,15 @@ CREATE TABLE IF NOT EXISTS vault_fs_operations (
 );
 CREATE INDEX IF NOT EXISTS idx_vault_fs_operations_storage_key
   ON vault_fs_operations(storage_key);
+
+CREATE TABLE IF NOT EXISTS vault_object_operations (
+  id TEXT PRIMARY KEY,
+  operation TEXT NOT NULL CHECK (operation IN ('put', 'delete')),
+  storage_key TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_vault_object_operations_storage_key
+  ON vault_object_operations(storage_key);
 
 CREATE TABLE IF NOT EXISTS email_rules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,8 +169,30 @@ export function openDatabase(databasePath: string, logger?: AppLogger): Database
   const database = new Database(resolved);
   database.pragma("busy_timeout = 5000");
   database.exec(SCHEMA);
+  migrateVaultStorageColumns(database);
   logger?.info({ databasePath: resolved }, "Database initialized");
   return database;
+}
+
+function migrateVaultStorageColumns(database: Database.Database): void {
+  const columns = new Set(
+    (database.pragma("table_info(vault_items)") as Array<{ name: string }>).map(({ name }) => name),
+  );
+  const additions = [
+    ["storage_backend", "TEXT NOT NULL DEFAULT 'local' CHECK (storage_backend IN ('local', 's3'))"],
+    ["detected_mime_type", "TEXT"],
+    ["media_kind", "TEXT"],
+    ["source_file_unique_id", "TEXT"],
+    ["source_caption", "TEXT"],
+  ] as const;
+  for (const [name, definition] of additions) {
+    if (!columns.has(name)) database.exec(`ALTER TABLE vault_items ADD COLUMN ${name} ${definition}`);
+  }
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_source_file
+      ON vault_items(source_chat_id, source_message_id, source_file_unique_id)
+      WHERE source_file_unique_id IS NOT NULL;
+  `);
 }
 
 export function getState(database: Database.Database, key: string): string | null {

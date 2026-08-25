@@ -12,7 +12,7 @@
 
 ### Telegram adapter
 
-`src/telegram/bot.ts` menerima update teks, foto, dan dokumen melalui long polling concurrent. Middleware pertama memverifikasi numeric owner ID dan private chat. Forward chat/file disimpan ke vault; gambar biasa tetap mengikuti alur vision. Progress edit dibatasi lajunya, request memiliki timeout, dan `/cancel` tetap responsif ketika model bekerja.
+`src/telegram/bot.ts` menerima teks, foto, dokumen, video, animation, audio, voice, video note, dan sticker melalui long polling concurrent. Middleware pertama memverifikasi numeric owner ID dan private chat. Attachment dan caption dinormalisasi sebagai satu request, diunduh dengan byte counter, divalidasi berdasarkan signature, disimpan ke Vault, lalu dianalisis sesuai tipe. Progress edit dibatasi lajunya, request memiliki timeout, dan `/cancel` tetap responsif ketika model bekerja.
 
 ### AI orchestrator
 
@@ -25,6 +25,7 @@
 - `search_gmail`
 - `search_web`
 - `save_vault_note`
+- `create_vault_text_file`
 - `create_vault_folder`
 - `search_vault`
 - `list_vault`
@@ -38,7 +39,19 @@ SQLite menyimpan riwayat pendek dan memori jangka panjang secara terpisah. Retri
 
 ### Vault
 
-`VaultService` memakai SQLite untuk struktur folder, nama, tipe, hash, sumber Telegram, dan isi catatan. Byte file memakai nama storage key acak di `VAULT_STORAGE_PATH`, sehingga nama pengguna tidak pernah menjadi path filesystem. Unique index pada `(parent, lower(name))` menolak nama duplikat di folder yang sama. Operasi file memakai journal SQLite serta staging/trash pada volume yang sama; startup merekonsiliasi operasi yang terputus. Path folder divalidasi penuh sebelum dibuat dalam satu transaksi.
+`VaultService` memakai SQLite untuk struktur folder, nama, tipe, hash, caption/sumber Telegram, backend, dan isi catatan. Byte file memakai storage key UUID, sehingga nama pengguna tidak pernah menjadi path fisik. Backend `local` mempertahankan staging/trash dan journal pada Volume; backend `s3` menyimpan file baru ke private Railway Bucket. Metadata per item membuat file legacy lokal tetap dapat dibaca setelah default diubah ke S3.
+
+Upload tidak mempercayai filename atau MIME Telegram. Executable/script dan archive generik ditolak; signature, ukuran aktual, serta SHA-256 disimpan/divalidasi. Dashboard memaksa download dengan `Content-Disposition: attachment` dan `nosniff`.
+
+### Attachment analyzer
+
+- Gambar statis dikirim sebagai vision input.
+- PDF, dokumen Office, text/code, dan spreadsheet dianalisis melalui OpenAI `input_file` pada Responses API tanpa tool.
+- Audio/voice ditranskripsikan tanpa tool.
+- Video tidak dikirim langsung ke model: FFmpeg non-shell mengekstrak frame terbatas dan audio; audio ditranskripsikan dan frame dikirim sebagai vision input.
+- Format lain dapat disimpan sebagai byte opaque, tetapi bot menyatakan bahwa analisis belum didukung.
+
+Seluruh OCR, isi dokumen, frame, dan transkrip dibungkus sebagai `UNTRUSTED_ATTACHMENT_DATA`. Turn attachment tidak diberi privileged tool, sehingga prompt injection di dalam file tidak dapat memberikan izin mutasi atau egress.
 
 Konteks otomatis dan pencarian vault hanya memasukkan metadata sebagai data tidak tepercaya. Isi note penuh hanya tersedia melalui tool read yang diotorisasi dari permintaan eksplisit pemilik; turn yang membaca note sensitif tidak diberi tool egress jaringan. Tool read-only tetap dapat mencari item dan mengantrekan file untuk dikirim kembali ke chat Telegram pemilik.
 
@@ -83,6 +96,7 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 | `memories` | Preferensi/fakta/komitmen personal |
 | `vault_items` | Struktur folder, catatan, dan metadata file vault |
 | `vault_fs_operations` | Journal staging/trash untuk recovery operasi file vault |
+| `vault_object_operations` | Journal retry upload/delete object S3 lintas crash |
 | `email_rules` | Deskripsi semantik dan Gmail query opsional |
 | `email_evaluations` | Deduplikasi dan audit hasil rule-message |
 | `email_processing_failures` | Retry/dead-letter fetch dan klasifikasi |
@@ -95,8 +109,8 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 
 - Telegram identity adalah authorization boundary utama.
 - `.env` adalah secret boundary dan tidak masuk Git.
-- Email, web, memory, data vault, dan teks di dalam gambar merupakan input tidak tepercaya.
-- Gambar dikirim ke model sebagai data URL dan tidak disimpan di database atau log.
+- Email, web, memory, data vault, OCR, dokumen, transkrip, dan frame video merupakan input tidak tepercaya.
+- Byte attachment disimpan sebagai object private dan tidak ditulis ke database atau log; SQLite hanya menyimpan metadata, caption, dan checksum.
 - Subject, snippet, dan body email yang dipotong dikirim ke OpenAI untuk klasifikasi/pencarian; tidak ditulis ke log.
 - OpenAI tidak diberi tool shell, email send, atau delete; mutasi vault hanya tersedia untuk intent eksplisit.
 - Gmail token hanya dibaca dari environment; tidak disimpan plaintext di database.
@@ -107,7 +121,6 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 Komponen yang dapat ditambahkan tanpa merombak core:
 
 - Calendar/reminder scheduler.
-- Voice-note transcription.
 - RAG dokumen pribadi sebagai tool baru.
 - Enkripsi secret dengan AES-256-GCM jika credential dipindahkan dari environment ke database.
 - Conversation summarization saat history panjang.

@@ -8,6 +8,7 @@ import {
   VaultService,
 } from "../src/services/vault.js";
 import { temporaryDatabase } from "./helpers.js";
+import type { VaultObjectStorage } from "../src/services/object-storage.js";
 
 describe("vault storage", () => {
   let setup: ReturnType<typeof temporaryDatabase>;
@@ -57,6 +58,74 @@ describe("vault storage", () => {
     expect(file.sha256).toHaveLength(64);
     expect(fs.readFileSync(vault.filePath(file.id))).toEqual(Buffer.from([1, 2, 3, 4]));
     expect(vault.stats()).toEqual({ folders: 0, files: 1, notes: 0, totalBytes: 4 });
+  });
+
+  it("stores new bytes in S3 while legacy local files remain readable", async () => {
+    const objects = new Map<string, Uint8Array>();
+    const storage: VaultObjectStorage = {
+      backend: "s3",
+      async put(key, bytes) { objects.set(key, Uint8Array.from(bytes)); },
+      async get(key) { return objects.get(key) ?? new Uint8Array(); },
+      async delete(key) { objects.delete(key); },
+    };
+    const bucketVault = new VaultService(setup.database, vault.storagePath, storage);
+    const legacy = bucketVault.saveFile({ name: "legacy.txt", bytes: Buffer.from("lama") });
+    const remote = await bucketVault.saveFileObject({
+      name: "video.mp4",
+      mimeType: "video/mp4",
+      detectedMimeType: "video/mp4",
+      mediaKind: "video",
+      fileUniqueId: "telegram-unique",
+      sourceCaption: "Bukti servis motor",
+      bytes: Buffer.from("bucket"),
+    });
+
+    expect(legacy.storageBackend).toBe("local");
+    expect(remote.storageBackend).toBe("s3");
+    expect(remote.sourceCaption).toBe("Bukti servis motor");
+    expect(Buffer.from(await bucketVault.fileBytes(legacy.id))).toEqual(Buffer.from("lama"));
+    expect(Buffer.from(await bucketVault.fileBytes(remote.id))).toEqual(Buffer.from("bucket"));
+    const localWriteVault = new VaultService(setup.database, vault.storagePath, storage, "local");
+    const newLocal = await localWriteVault.saveFileObject({
+      name: "lokal-lagi.txt",
+      bytes: Buffer.from("lokal"),
+    });
+    expect(newLocal.storageBackend).toBe("local");
+    expect(Buffer.from(await localWriteVault.fileBytes(remote.id))).toEqual(Buffer.from("bucket"));
+    await expect(localWriteVault.deleteStored(remote.id)).resolves.toBe(1);
+    expect(objects.size).toBe(0);
+  });
+
+  it("journals failed S3 cleanup and retries it during startup reconciliation", async () => {
+    const objects = new Map<string, Uint8Array>();
+    let failDelete = true;
+    const storage: VaultObjectStorage = {
+      backend: "s3",
+      async put(key, bytes) { objects.set(key, Uint8Array.from(bytes)); },
+      async get(key) { return objects.get(key) ?? new Uint8Array(); },
+      async delete(key) {
+        if (failDelete) throw new Error("temporary S3 failure");
+        objects.delete(key);
+      },
+    };
+    const bucketVault = new VaultService(setup.database, vault.storagePath, storage);
+    const item = await bucketVault.saveFileObject({
+      name: "bukti.mp4",
+      bytes: Buffer.from("video"),
+    });
+
+    await expect(bucketVault.deleteStored(item.id)).resolves.toBe(1);
+    expect(objects.size).toBe(1);
+    expect(
+      (setup.database.prepare("SELECT count(*) AS count FROM vault_object_operations").get() as { count: number }).count,
+    ).toBe(1);
+
+    failDelete = false;
+    await bucketVault.reconcileObjectStorageOperations();
+    expect(objects.size).toBe(0);
+    expect(
+      (setup.database.prepare("SELECT count(*) AS count FROM vault_object_operations").get() as { count: number }).count,
+    ).toBe(0);
   });
 
   it("removes staging and metadata when a file insert fails", () => {

@@ -23,6 +23,12 @@ import {
 import type { TelegramHistoryService } from "../services/telegram-history.js";
 import type { WebSearchProvider } from "../services/web-search.js";
 import {
+  analyzeAttachment,
+  readResponseBytesBounded,
+  validateAttachment,
+  type IncomingAttachment,
+} from "../services/attachments.js";
+import {
   PendingImageCoordinator,
   type PendingImageSource,
 } from "./pending-images.js";
@@ -30,7 +36,7 @@ import {
 const HELP_TEXT = `Asisten personal siap digunakan.
 
 Contoh:
-• Kirim gambar dengan caption pertanyaan untuk langsung dianalisis.
+• Kirim foto, video, audio, atau dokumen untuk disimpan dan dianalisis sesuai formatnya.
 • Kirim gambar tanpa caption, lalu kirim pertanyaan pada pesan berikutnya.
 • Ingat bahwa saya lebih suka jawaban singkat.
 • Kalau ada email tentang invoice proyek Alpha, kabari saya.
@@ -100,6 +106,17 @@ interface ProgressController {
   update(text: string, force?: boolean): void;
   finish(text: string, allowAfterAbort?: boolean): Promise<void>;
 }
+
+interface PreparedAssistantInput {
+  images?: AssistantImageInput[];
+  attachmentContext?: Record<string, unknown>;
+  footer?: string;
+}
+
+type AssistantInputSource =
+  | AssistantImageInput
+  | PreparedAssistantInput
+  | ((signal: AbortSignal) => Promise<AssistantImageInput | PreparedAssistantInput>);
 
 interface TelegramCallOptions {
   signal?: AbortSignal;
@@ -320,19 +337,7 @@ async function downloadTelegramFile(
     signal ? { signal } : undefined,
   );
   if (!response.ok) throw new InvalidVaultOperationError(`Gagal mengunduh file (${response.status}).`);
-  const contentLength = Number(response.headers.get("content-length") ?? 0);
-  if (contentLength > config.VAULT_MAX_FILE_BYTES) {
-    throw new InvalidVaultOperationError(
-      `Ukuran file melebihi batas vault ${formatByteLimit(config.VAULT_MAX_FILE_BYTES)}.`,
-    );
-  }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > config.VAULT_MAX_FILE_BYTES) {
-    throw new InvalidVaultOperationError(
-      `Ukuran file melebihi batas vault ${formatByteLimit(config.VAULT_MAX_FILE_BYTES)}.`,
-    );
-  }
-  return bytes;
+  return readResponseBytesBounded(response, config.VAULT_MAX_FILE_BYTES);
 }
 
 function imageMimeFromPath(filePath: string): string | null {
@@ -414,11 +419,11 @@ async function downloadTelegramImage(
   if (!mimeType) {
     throw new ImageInputError("Format gambar belum didukung. Gunakan JPEG, PNG, WebP, atau GIF.");
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > config.TELEGRAM_IMAGE_MAX_BYTES) {
-    throw new ImageInputError(
-      `Ukuran gambar melebihi batas ${formatByteLimit(config.TELEGRAM_IMAGE_MAX_BYTES)}.`,
-    );
+  let bytes: Uint8Array;
+  try {
+    bytes = await readResponseBytesBounded(response, config.TELEGRAM_IMAGE_MAX_BYTES);
+  } catch (error) {
+    throw new ImageInputError(error instanceof Error ? error.message : "Gambar terlalu besar.");
   }
   if (bytes.byteLength === 0) throw new ImageInputError("File gambar kosong.");
   return {
@@ -530,7 +535,7 @@ export function createTelegramBot(
 ): Bot {
   const bot = new Bot(config.TELEGRAM_BOT_TOKEN);
   const activeRequests = new Map<string, ActiveRequest>();
-  const pendingImages = new PendingImageCoordinator<AssistantImageInput>();
+  const pendingImages = new PendingImageCoordinator<PreparedAssistantInput>();
 
   bot.api.config.use(async (previous, method, payload, signal) => {
     const response = await previous(method, payload, signal);
@@ -555,7 +560,7 @@ export function createTelegramBot(
 
   function takePendingImage(
     chatId: string,
-  ): PendingImageSource<AssistantImageInput> | null {
+  ): PendingImageSource<PreparedAssistantInput> | null {
     return pendingImages.take(chatId);
   }
 
@@ -584,9 +589,13 @@ export function createTelegramBot(
       );
       return;
     }
+    const inputFile =
+      item.storageBackend === "s3"
+        ? new InputFile(await dependencies.vault.fileBytes(item.id, callOptions.signal), item.name)
+        : new InputFile(dependencies.vault.filePath(item.id), item.name);
     await awaitTelegramCall(
       (signal) =>
-        ctx.replyWithDocument(new InputFile(dependencies.vault.filePath(item.id), item.name), {
+        ctx.replyWithDocument(inputFile, {
           caption: `📎 ${dependencies.vault.pathFor(item.id)} · ${formatBytes(item.sizeBytes)}`,
         }, asGrammySignal(signal)),
       callOptions,
@@ -597,10 +606,13 @@ export function createTelegramBot(
     ctx: Context,
     input: {
       fileId: string;
+      fileUniqueId: string;
+      kind: IncomingAttachment["kind"];
       fileName: string;
       mimeType?: string;
       fileSize?: number;
       folderPath?: string;
+      durationSeconds?: number;
     },
   ): Promise<void> {
     const status = await awaitTelegramCall((signal) =>
@@ -617,10 +629,22 @@ export function createTelegramBot(
         input.fileId,
         input.fileSize,
       );
-      const item = dependencies.vault.saveFile({
-        name: input.fileName,
-        ...(input.mimeType ? { mimeType: input.mimeType } : {}),
-        bytes,
+      const validated = await validateAttachment({
+        kind: input.kind,
+        fileId: input.fileId,
+        fileUniqueId: input.fileUniqueId,
+        fileName: input.fileName,
+        ...(input.mimeType ? { claimedMimeType: input.mimeType } : {}),
+        ...(input.fileSize ? { fileSize: input.fileSize } : {}),
+        ...(input.durationSeconds ? { durationSeconds: input.durationSeconds } : {}),
+      }, bytes);
+      const item = await dependencies.vault.saveFileObject({
+        name: validated.attachment.fileName,
+        mimeType: validated.detectedMimeType,
+        detectedMimeType: validated.detectedMimeType,
+        mediaKind: validated.attachment.kind,
+        fileUniqueId: validated.attachment.fileUniqueId,
+        bytes: validated.bytes,
         parentId: parent?.id ?? null,
         chatId: String(ctx.chat!.id),
         messageId: String(ctx.message?.message_id ?? ""),
@@ -648,7 +672,7 @@ export function createTelegramBot(
   async function processAssistantRequest(
     ctx: Context,
     text: string,
-    imageSource?: AssistantImageInput | ((signal: AbortSignal) => Promise<AssistantImageInput>),
+    inputSource?: AssistantInputSource,
   ): Promise<void> {
     const chatId = String(ctx.chat!.id);
     const existing = activeRequests.get(chatId);
@@ -659,7 +683,7 @@ export function createTelegramBot(
       );
       return;
     }
-    const inputKind = imageSource ? "image" : "text";
+    const inputKind = inputSource ? "image" : "text";
     const trace = dependencies.traces.start(chatId, config.OPENAI_CHAT_MODEL, inputKind);
     let resolveFinished: () => void = () => undefined;
     const finished = new Promise<void>((resolve) => {
@@ -691,7 +715,7 @@ export function createTelegramBot(
         (signal) =>
           ctx.reply(
             inputKind === "image"
-              ? "📷 Gambar diterima. Menyiapkan analisis…"
+              ? "📎 Attachment diterima. Menyiapkan analisis…"
               : "⏳ Memproses permintaan…",
             {},
             asGrammySignal(signal),
@@ -724,21 +748,22 @@ export function createTelegramBot(
       typingTimer = setInterval(sendTyping, 4000);
       dependencies.traces.addStage(trace.requestId, "received", "Permintaan diterima");
 
-      let image: AssistantImageInput | undefined;
-      if (typeof imageSource === "function") {
-        dependencies.traces.addStage(trace.requestId, "image_download", "Mengunduh gambar Telegram");
+      let prepared: PreparedAssistantInput = {};
+      if (typeof inputSource === "function") {
+        dependencies.traces.addStage(trace.requestId, "attachment_download", "Mengunduh attachment Telegram");
         progress.update(
-          liveTrace ? traceProgressText(trace, "Mengunduh gambar Telegram") : "📥 Mengunduh gambar…",
+          liveTrace ? traceProgressText(trace, "Mengunduh attachment Telegram") : "📥 Mengunduh attachment…",
           true,
         );
-        image = await awaitWithSignal(
-          imageSource(active.controller.signal),
+        const loaded = await awaitWithSignal(
+          inputSource(active.controller.signal),
           active.controller.signal,
         );
-        dependencies.traces.addStage(trace.requestId, "image_ready", "Gambar siap dianalisis");
-      } else if (imageSource) {
-        image = imageSource;
-        dependencies.traces.addStage(trace.requestId, "image_ready", "Gambar sementara siap dianalisis");
+        prepared = "dataUrl" in loaded ? { images: [loaded] } : loaded;
+        dependencies.traces.addStage(trace.requestId, "attachment_ready", "Attachment siap dianalisis");
+      } else if (inputSource) {
+        prepared = "dataUrl" in inputSource ? { images: [inputSource] } : inputSource;
+        dependencies.traces.addStage(trace.requestId, "attachment_ready", "Attachment sementara siap dianalisis");
       }
 
       const onEvent = (event: AssistantEvent) => {
@@ -772,12 +797,19 @@ export function createTelegramBot(
 
       const answer = await dependencies.assistant.reply(
         chatId,
-        image ? { text, images: [image] } : text,
+        prepared.images?.length || prepared.attachmentContext
+          ? {
+              text,
+              ...(prepared.images?.length ? { images: prepared.images } : {}),
+              ...(prepared.attachmentContext ? { attachmentContext: prepared.attachmentContext } : {}),
+            }
+          : text,
         { signal: active.controller.signal, onEvent },
       );
       dependencies.traces.addStage(trace.requestId, "answer_ready", "Jawaban siap");
       const completedTrace = dependencies.traces.finish(trace.requestId, "completed")!;
-      const chunks = splitTelegramMessage(answer);
+      const finalAnswer = prepared.footer ? `${answer}\n\n${prepared.footer}` : answer;
+      const chunks = splitTelegramMessage(finalAnswer);
       if (liveTrace) {
         await progress.finish(`✅ Selesai\n\n${formatRequestTrace(completedTrace)}`);
         for (const chunk of chunks) {
@@ -810,7 +842,7 @@ export function createTelegramBot(
           `⌛ Proses melewati batas ${config.ASSISTANT_TIMEOUT_SECONDS} detik. Silakan coba lagi.`,
           true,
         );
-      } else if (error instanceof ImageInputError) {
+      } else if (error instanceof ImageInputError || error instanceof InvalidVaultOperationError) {
         await progress?.finish(`⚠️ ${error.message}`, true);
       } else {
         logger.error({ errorMessage: safeMessage }, "Assistant response failed");
@@ -827,12 +859,93 @@ export function createTelegramBot(
     }
   }
 
-  async function receiveImage(
+  async function prepareIncomingAttachment(
     ctx: Context,
-    fileId: string,
-    hintedMimeType: string | undefined,
-    knownFileSize: number | undefined,
-    caption: string | undefined,
+    attachment: IncomingAttachment,
+    signal: AbortSignal,
+  ): Promise<PreparedAssistantInput> {
+    const bytes = await downloadTelegramFile(
+      ctx,
+      config,
+      attachment.fileId,
+      attachment.fileSize,
+      signal,
+    );
+    const validated = await validateAttachment(attachment, bytes);
+    let fileName = validated.attachment.fileName;
+    if (dependencies.vault.findDuplicateName(fileName, null)) {
+      const extension = fileName.includes(".") ? `.${fileName.split(".").pop()}` : "";
+      const base = extension ? fileName.slice(0, -extension.length) : fileName;
+      fileName = `${base} (Telegram ${ctx.message!.message_id})${extension}`;
+    }
+    const item = await dependencies.vault.saveFileObject(
+      {
+        name: fileName,
+        mimeType: validated.detectedMimeType,
+        detectedMimeType: validated.detectedMimeType,
+        mediaKind: attachment.kind,
+        fileUniqueId: attachment.fileUniqueId,
+        sourceCaption: attachment.caption ?? null,
+        bytes: validated.bytes,
+        chatId: String(ctx.chat!.id),
+        messageId: String(ctx.message!.message_id),
+      },
+      signal,
+    );
+    const vaultPath = dependencies.vault.pathFor(item.id);
+    try {
+      await awaitTelegramCall(
+        (telegramSignal) =>
+          ctx.reply(
+            `✅ File tersimpan: ${vaultPath} (#${item.id}, ${formatBytes(item.sizeBytes)}, ${item.storageBackend === "s3" ? "Bucket" : "Volume"}). Analisis dilanjutkan…`,
+            {},
+            asGrammySignal(telegramSignal),
+          ),
+        { timeoutMs: TELEGRAM_API_TIMEOUT_MS },
+      );
+    } catch (error) {
+      logger.warn(
+        { itemId: item.id, errorMessage: safeErrorMessage(error) },
+        "Attachment storage acknowledgement failed",
+      );
+    }
+    let analysis: Awaited<ReturnType<typeof analyzeAttachment>>;
+    try {
+      analysis = await analyzeAttachment(
+        dependencies.assistant.openaiClient,
+        config,
+        validated,
+        attachment.caption ?? "",
+        signal,
+      );
+    } catch (error) {
+      if (signal.aborted) throw signal.reason;
+      logger.warn(
+        { itemId: item.id, errorMessage: safeErrorMessage(error) },
+        "Attachment analysis failed after safe storage",
+      );
+      analysis = { warning: "File sudah tersimpan, tetapi analisis otomatis gagal untuk format ini." };
+    }
+    return {
+      ...(analysis.images?.length ? { images: analysis.images } : {}),
+      attachmentContext: {
+        attachment: {
+          kind: attachment.kind,
+          name: item.name,
+          mimeType: item.detectedMimeType ?? item.mimeType,
+          sizeBytes: item.sizeBytes,
+        },
+        vault: { saved: true, id: item.id, path: vaultPath, backend: item.storageBackend },
+        ...(analysis.summary ? { extractedAnalysis: analysis.summary } : {}),
+        ...(analysis.warning ? { analysisWarning: analysis.warning } : {}),
+      },
+      footer: `✅ File tersimpan: ${vaultPath} (#${item.id}, ${formatBytes(item.sizeBytes)}, ${item.storageBackend === "s3" ? "Bucket" : "Volume"})`,
+    };
+  }
+
+  async function receiveAttachment(
+    ctx: Context,
+    attachment: IncomingAttachment,
   ): Promise<void> {
     const chatId = String(ctx.chat!.id);
     // Do not await the negative busy check: another update (/cancel or text) may
@@ -845,18 +958,19 @@ export function createTelegramBot(
       );
       return;
     }
-    const trimmedCaption = caption?.trim();
-    const loader = (signal: AbortSignal) =>
-      downloadTelegramImage(
-        ctx,
-        config,
-        fileId,
-        hintedMimeType,
-        knownFileSize,
-        signal,
-      );
+    const trimmedCaption = attachment.caption?.trim();
+    const loader = (signal: AbortSignal) => prepareIncomingAttachment(ctx, attachment, signal);
     if (trimmedCaption) {
       await processAssistantRequest(ctx, trimmedCaption, loader);
+      return;
+    }
+
+    if (attachment.kind !== "photo") {
+      await processAssistantRequest(
+        ctx,
+        `Analisis ${attachment.kind.replace("_", " ")} ini dan jelaskan temuan pentingnya.`,
+        loader,
+      );
       return;
     }
 
@@ -881,17 +995,18 @@ export function createTelegramBot(
     }
     let acknowledgement: string;
     try {
-      await pendingOperation.promise;
+      const ready = await pendingOperation.promise;
       acknowledgement = pendingOperation.wasClaimed()
         ? "📷 Gambar diterima dan sedang dipakai untuk menjawab pertanyaan Anda."
-        : `📷 Gambar diterima. Kirim pertanyaan dalam ${Math.floor(
+        : `${ready.footer ?? "📷 Gambar diterima."}\nKirim pertanyaan dalam ${Math.floor(
             config.TELEGRAM_PENDING_IMAGE_SECONDS / 60,
-          )} menit. Gambar hanya disimpan sementara di memori.`;
+          )} menit.`;
+      if (!pendingOperation.wasClaimed()) delete ready.footer;
     } catch (error) {
       acknowledgement =
         pendingOperation.wasAborted()
           ? "⛔ Pengunduhan gambar dibatalkan."
-          : error instanceof ImageInputError
+          : error instanceof ImageInputError || error instanceof InvalidVaultOperationError
           ? `⚠️ ${error.message}`
           : "Maaf, gambar gagal diunduh. Silakan kirim ulang.";
       if (!pendingOperation.wasAborted() && !(error instanceof ImageInputError)) {
@@ -1026,6 +1141,8 @@ export function createTelegramBot(
     if (replied?.document) {
       await saveTelegramFile(ctx, {
         fileId: replied.document.file_id,
+        fileUniqueId: replied.document.file_unique_id,
+        kind: "document",
         fileName: replied.document.file_name ?? `Dokumen Telegram ${replied.message_id}`,
         ...(replied.document.mime_type ? { mimeType: replied.document.mime_type } : {}),
         ...(replied.document.file_size ? { fileSize: replied.document.file_size } : {}),
@@ -1041,9 +1158,93 @@ export function createTelegramBot(
       }
       await saveTelegramFile(ctx, {
         fileId: photo.file_id,
+        fileUniqueId: photo.file_unique_id,
+        kind: "photo",
         fileName: generatedPhotoName(replied.message_id),
         mimeType: "image/jpeg",
         ...(photo.file_size ? { fileSize: photo.file_size } : {}),
+        ...(args ? { folderPath: args } : {}),
+      });
+      return;
+    }
+    if (replied?.video) {
+      await saveTelegramFile(ctx, {
+        fileId: replied.video.file_id,
+        fileUniqueId: replied.video.file_unique_id,
+        kind: "video",
+        fileName: replied.video.file_name ?? `Video Telegram ${replied.message_id}.mp4`,
+        ...(replied.video.mime_type ? { mimeType: replied.video.mime_type } : {}),
+        ...(replied.video.file_size ? { fileSize: replied.video.file_size } : {}),
+        durationSeconds: replied.video.duration,
+        ...(args ? { folderPath: args } : {}),
+      });
+      return;
+    }
+    if (replied?.animation) {
+      await saveTelegramFile(ctx, {
+        fileId: replied.animation.file_id,
+        fileUniqueId: replied.animation.file_unique_id,
+        kind: "animation",
+        fileName: replied.animation.file_name ?? `Animasi Telegram ${replied.message_id}.mp4`,
+        ...(replied.animation.mime_type ? { mimeType: replied.animation.mime_type } : {}),
+        ...(replied.animation.file_size ? { fileSize: replied.animation.file_size } : {}),
+        durationSeconds: replied.animation.duration,
+        ...(args ? { folderPath: args } : {}),
+      });
+      return;
+    }
+    if (replied?.audio) {
+      await saveTelegramFile(ctx, {
+        fileId: replied.audio.file_id,
+        fileUniqueId: replied.audio.file_unique_id,
+        kind: "audio",
+        fileName: replied.audio.file_name ?? `Audio Telegram ${replied.message_id}.mp3`,
+        ...(replied.audio.mime_type ? { mimeType: replied.audio.mime_type } : {}),
+        ...(replied.audio.file_size ? { fileSize: replied.audio.file_size } : {}),
+        durationSeconds: replied.audio.duration,
+        ...(args ? { folderPath: args } : {}),
+      });
+      return;
+    }
+    if (replied?.voice) {
+      await saveTelegramFile(ctx, {
+        fileId: replied.voice.file_id,
+        fileUniqueId: replied.voice.file_unique_id,
+        kind: "voice",
+        fileName: `Voice Telegram ${replied.message_id}.ogg`,
+        ...(replied.voice.mime_type ? { mimeType: replied.voice.mime_type } : {}),
+        ...(replied.voice.file_size ? { fileSize: replied.voice.file_size } : {}),
+        durationSeconds: replied.voice.duration,
+        ...(args ? { folderPath: args } : {}),
+      });
+      return;
+    }
+    if (replied?.video_note) {
+      await saveTelegramFile(ctx, {
+        fileId: replied.video_note.file_id,
+        fileUniqueId: replied.video_note.file_unique_id,
+        kind: "video_note",
+        fileName: `Video Note Telegram ${replied.message_id}.mp4`,
+        mimeType: "video/mp4",
+        ...(replied.video_note.file_size ? { fileSize: replied.video_note.file_size } : {}),
+        durationSeconds: replied.video_note.duration,
+        ...(args ? { folderPath: args } : {}),
+      });
+      return;
+    }
+    if (replied?.sticker) {
+      const extension = replied.sticker.is_animated ? "tgs" : replied.sticker.is_video ? "webm" : "webp";
+      await saveTelegramFile(ctx, {
+        fileId: replied.sticker.file_id,
+        fileUniqueId: replied.sticker.file_unique_id,
+        kind: "sticker",
+        fileName: `Sticker Telegram ${replied.message_id}.${extension}`,
+        mimeType: replied.sticker.is_animated
+          ? "application/x-tgsticker"
+          : replied.sticker.is_video
+            ? "video/webm"
+            : "image/webp",
+        ...(replied.sticker.file_size ? { fileSize: replied.sticker.file_size } : {}),
         ...(args ? { folderPath: args } : {}),
       });
       return;
@@ -1163,7 +1364,7 @@ export function createTelegramBot(
       return;
     }
     try {
-      const deleted = dependencies.vault.delete(Number(match[1]));
+      const deleted = await dependencies.vault.deleteStored(Number(match[1]));
       await ctx.reply(`🗑️ Item dihapus (${deleted} item termasuk isi folder).`);
     } catch (error) {
       await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "Item gagal dihapus."}`);
@@ -1321,6 +1522,8 @@ export function createTelegramBot(
         `• Token output maksimum: ${config.OPENAI_MAX_OUTPUT_TOKENS}`,
         `• Timeout assistant: ${config.ASSISTANT_TIMEOUT_SECONDS} detik`,
         `• Analisis gambar: aktif (maks. ${formatByteLimit(config.TELEGRAM_IMAGE_MAX_BYTES)})`,
+        `• Analisis attachment: ${config.ATTACHMENT_ANALYSIS_ENABLED ? "aktif" : "nonaktif"}`,
+        `• Penyimpanan file baru: ${config.VAULT_STORAGE_BACKEND === "s3" ? "Railway Bucket (S3)" : "Volume lokal"}`,
         `• Trace live: ${dependencies.traces.isLiveEnabled(String(ctx.chat.id)) ? "aktif" : "nonaktif"}`,
         `• Gmail: ${dependencies.gmailConfigured ? "terhubung" : "belum dikonfigurasi"}`,
         `• Web search: ${dependencies.search.available ? dependencies.search.name : "belum dikonfigurasi"}`,
@@ -1341,6 +1544,8 @@ export function createTelegramBot(
     if (/^\/save(?:@\w+)?(?:\s|$)/u.test(ctx.message.caption ?? "") || ctx.message.forward_origin) {
       await saveTelegramFile(ctx, {
         fileId: photo.file_id,
+        fileUniqueId: photo.file_unique_id,
+        kind: "photo",
         fileName: generatedPhotoName(ctx.message.message_id),
         mimeType: "image/jpeg",
         ...(photo.file_size ? { fileSize: photo.file_size } : {}),
@@ -1348,21 +1553,25 @@ export function createTelegramBot(
       });
       return;
     }
-    await receiveImage(
-      ctx,
-      photo.file_id,
-      "image/jpeg",
-      photo.file_size,
-      ctx.message.caption,
-    );
+    await receiveAttachment(ctx, {
+      kind: "photo",
+      fileId: photo.file_id,
+      fileUniqueId: photo.file_unique_id,
+      fileName: generatedPhotoName(ctx.message.message_id),
+      claimedMimeType: "image/jpeg",
+      ...(photo.file_size ? { fileSize: photo.file_size } : {}),
+      ...(ctx.message.caption ? { caption: ctx.message.caption } : {}),
+    });
   });
 
   bot.on("message:document", async (ctx) => {
     const document = ctx.message.document;
     const saveCaption = /^\/save(?:@\w+)?(?:\s|$)/u.test(ctx.message.caption ?? "");
-    if (!document.mime_type?.startsWith("image/") || saveCaption || ctx.message.forward_origin) {
+    if (saveCaption || ctx.message.forward_origin) {
       await saveTelegramFile(ctx, {
         fileId: document.file_id,
+        fileUniqueId: document.file_unique_id,
+        kind: "document",
         fileName: document.file_name ?? `Dokumen Telegram ${ctx.message.message_id}`,
         ...(document.mime_type ? { mimeType: document.mime_type } : {}),
         ...(document.file_size ? { fileSize: document.file_size } : {}),
@@ -1372,17 +1581,158 @@ export function createTelegramBot(
       });
       return;
     }
-    if (!document.mime_type?.startsWith("image/")) {
-      await ctx.reply("Dokumen ini bukan gambar. Format gambar yang didukung: JPEG, PNG, WebP, GIF.");
+    await receiveAttachment(ctx, {
+      kind: "document",
+      fileId: document.file_id,
+      fileUniqueId: document.file_unique_id,
+      fileName: document.file_name ?? `Dokumen Telegram ${ctx.message.message_id}`,
+      ...(document.mime_type ? { claimedMimeType: document.mime_type } : {}),
+      ...(document.file_size ? { fileSize: document.file_size } : {}),
+      ...(ctx.message.caption ? { caption: ctx.message.caption } : {}),
+    });
+  });
+
+  bot.on("message:video", async (ctx) => {
+    const video = ctx.message.video;
+    const saveCaption = /^\/save(?:@\w+)?(?:\s|$)/u.test(ctx.message.caption ?? "");
+    const attachment: IncomingAttachment = {
+      kind: "video",
+      fileId: video.file_id,
+      fileUniqueId: video.file_unique_id,
+      fileName: video.file_name ?? `Video Telegram ${ctx.message.message_id}.mp4`,
+      claimedMimeType: video.mime_type ?? "video/mp4",
+      ...(video.file_size ? { fileSize: video.file_size } : {}),
+      durationSeconds: video.duration,
+      ...(ctx.message.caption ? { caption: ctx.message.caption } : {}),
+    };
+    if (saveCaption || ctx.message.forward_origin) {
+      await saveTelegramFile(ctx, {
+        fileId: attachment.fileId,
+        fileUniqueId: attachment.fileUniqueId,
+        kind: attachment.kind,
+        fileName: attachment.fileName,
+        ...(attachment.claimedMimeType ? { mimeType: attachment.claimedMimeType } : {}),
+        ...(attachment.fileSize ? { fileSize: attachment.fileSize } : {}),
+        ...(attachment.durationSeconds ? { durationSeconds: attachment.durationSeconds } : {}),
+        ...(saveCaption ? { folderPath: commandArguments(ctx.message.caption) } : {}),
+      });
       return;
     }
-    await receiveImage(
-      ctx,
-      document.file_id,
-      document.mime_type,
-      document.file_size,
-      ctx.message.caption,
-    );
+    await receiveAttachment(ctx, attachment);
+  });
+
+  bot.on("message:animation", async (ctx) => {
+    const animation = ctx.message.animation;
+    const saveCaption = /^\/save(?:@\w+)?(?:\s|$)/u.test(ctx.message.caption ?? "");
+    if (saveCaption || ctx.message.forward_origin) {
+      await saveTelegramFile(ctx, {
+        fileId: animation.file_id,
+        fileUniqueId: animation.file_unique_id,
+        kind: "animation",
+        fileName: animation.file_name ?? `Animasi Telegram ${ctx.message.message_id}.mp4`,
+        ...(animation.mime_type ? { mimeType: animation.mime_type } : {}),
+        ...(animation.file_size ? { fileSize: animation.file_size } : {}),
+        durationSeconds: animation.duration,
+        ...(saveCaption ? { folderPath: commandArguments(ctx.message.caption) } : {}),
+      });
+      return;
+    }
+    await receiveAttachment(ctx, {
+      kind: "animation",
+      fileId: animation.file_id,
+      fileUniqueId: animation.file_unique_id,
+      fileName: animation.file_name ?? `Animasi Telegram ${ctx.message.message_id}.mp4`,
+      claimedMimeType: animation.mime_type ?? "video/mp4",
+      ...(animation.file_size ? { fileSize: animation.file_size } : {}),
+      durationSeconds: animation.duration,
+      ...(ctx.message.caption ? { caption: ctx.message.caption } : {}),
+    });
+  });
+
+  bot.on("message:audio", async (ctx) => {
+    const audio = ctx.message.audio;
+    const saveCaption = /^\/save(?:@\w+)?(?:\s|$)/u.test(ctx.message.caption ?? "");
+    if (saveCaption || ctx.message.forward_origin) {
+      await saveTelegramFile(ctx, {
+        fileId: audio.file_id,
+        fileUniqueId: audio.file_unique_id,
+        kind: "audio",
+        fileName: audio.file_name ?? `Audio Telegram ${ctx.message.message_id}.mp3`,
+        ...(audio.mime_type ? { mimeType: audio.mime_type } : {}),
+        ...(audio.file_size ? { fileSize: audio.file_size } : {}),
+        durationSeconds: audio.duration,
+        ...(saveCaption ? { folderPath: commandArguments(ctx.message.caption) } : {}),
+      });
+      return;
+    }
+    await receiveAttachment(ctx, {
+      kind: "audio",
+      fileId: audio.file_id,
+      fileUniqueId: audio.file_unique_id,
+      fileName: audio.file_name ?? `Audio Telegram ${ctx.message.message_id}.mp3`,
+      claimedMimeType: audio.mime_type ?? "audio/mpeg",
+      ...(audio.file_size ? { fileSize: audio.file_size } : {}),
+      durationSeconds: audio.duration,
+      ...(ctx.message.caption ? { caption: ctx.message.caption } : {}),
+    });
+  });
+
+  bot.on("message:voice", async (ctx) => {
+    const voice = ctx.message.voice;
+    const saveCaption = /^\/save(?:@\w+)?(?:\s|$)/u.test(ctx.message.caption ?? "");
+    if (saveCaption || ctx.message.forward_origin) {
+      await saveTelegramFile(ctx, {
+        fileId: voice.file_id,
+        fileUniqueId: voice.file_unique_id,
+        kind: "voice",
+        fileName: `Voice Telegram ${ctx.message.message_id}.ogg`,
+        ...(voice.mime_type ? { mimeType: voice.mime_type } : {}),
+        ...(voice.file_size ? { fileSize: voice.file_size } : {}),
+        durationSeconds: voice.duration,
+        ...(saveCaption ? { folderPath: commandArguments(ctx.message.caption) } : {}),
+      });
+      return;
+    }
+    await receiveAttachment(ctx, {
+      kind: "voice",
+      fileId: voice.file_id,
+      fileUniqueId: voice.file_unique_id,
+      fileName: `Voice Telegram ${ctx.message.message_id}.ogg`,
+      claimedMimeType: voice.mime_type ?? "audio/ogg",
+      ...(voice.file_size ? { fileSize: voice.file_size } : {}),
+      durationSeconds: voice.duration,
+      ...(ctx.message.caption ? { caption: ctx.message.caption } : {}),
+    });
+  });
+
+  bot.on("message:video_note", async (ctx) => {
+    const video = ctx.message.video_note;
+    await receiveAttachment(ctx, {
+      kind: "video_note",
+      fileId: video.file_id,
+      fileUniqueId: video.file_unique_id,
+      fileName: `Video Note Telegram ${ctx.message.message_id}.mp4`,
+      claimedMimeType: "video/mp4",
+      ...(video.file_size ? { fileSize: video.file_size } : {}),
+      durationSeconds: video.duration,
+    });
+  });
+
+  bot.on("message:sticker", async (ctx) => {
+    const sticker = ctx.message.sticker;
+    const extension = sticker.is_animated ? "tgs" : sticker.is_video ? "webm" : "webp";
+    await receiveAttachment(ctx, {
+      kind: "sticker",
+      fileId: sticker.file_id,
+      fileUniqueId: sticker.file_unique_id,
+      fileName: `Sticker Telegram ${ctx.message.message_id}.${extension}`,
+      claimedMimeType: sticker.is_animated
+        ? "application/x-tgsticker"
+        : sticker.is_video
+          ? "video/webm"
+          : "image/webp",
+      ...(sticker.file_size ? { fileSize: sticker.file_size } : {}),
+    });
   });
 
   bot.on("message:text", async (ctx) => {

@@ -2,7 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
-import type { VaultItem, VaultItemKind, VaultStats } from "../types.js";
+import type {
+  VaultItem,
+  VaultItemKind,
+  VaultStats,
+  VaultStorageBackend,
+} from "../types.js";
+import type { VaultObjectStorage } from "./object-storage.js";
 
 interface VaultRow {
   id: number;
@@ -12,6 +18,11 @@ interface VaultRow {
   mime_type: string | null;
   size_bytes: number;
   storage_key: string | null;
+  storage_backend: VaultStorageBackend;
+  detected_mime_type: string | null;
+  media_kind: string | null;
+  source_file_unique_id: string | null;
+  source_caption: string | null;
   content: string | null;
   sha256: string | null;
   source_chat_id: string | null;
@@ -23,6 +34,12 @@ interface VaultRow {
 interface VaultFsOperationRow {
   id: string;
   operation: "save" | "delete";
+  storage_key: string;
+}
+
+interface VaultObjectOperationRow {
+  id: string;
+  operation: "put" | "delete";
   storage_key: string;
 }
 
@@ -42,6 +59,10 @@ export interface SaveVaultFileInput extends VaultSource {
   parentId?: number | null;
   name: string;
   mimeType?: string | null;
+  detectedMimeType?: string | null;
+  mediaKind?: string | null;
+  fileUniqueId?: string | null;
+  sourceCaption?: string | null;
   bytes: Uint8Array;
 }
 
@@ -68,6 +89,11 @@ function mapRow(row: VaultRow): VaultItem {
     mimeType: row.mime_type,
     sizeBytes: row.size_bytes,
     storageKey: row.storage_key,
+    storageBackend: row.storage_backend,
+    detectedMimeType: row.detected_mime_type,
+    mediaKind: row.media_kind,
+    sourceFileUniqueId: row.source_file_unique_id,
+    sourceCaption: row.source_caption,
     content: row.content,
     sha256: row.sha256,
     sourceChatId: row.source_chat_id,
@@ -109,7 +135,7 @@ function noteTerms(value: string): Set<string> {
 function relevance(query: string, item: VaultItem): number {
   const queryTerms = noteTerms(query);
   if (queryTerms.size === 0) return 0;
-  const itemTerms = noteTerms(`${item.name} ${item.content ?? ""}`);
+  const itemTerms = noteTerms(`${item.name} ${item.content ?? ""} ${item.sourceCaption ?? ""}`);
   let overlap = 0;
   for (const term of queryTerms) if (itemTerms.has(term)) overlap += 1;
   return overlap / queryTerms.size;
@@ -123,7 +149,12 @@ export class VaultService {
   constructor(
     private readonly database: Database.Database,
     storagePath: string,
+    private readonly objectStorage: VaultObjectStorage | null = null,
+    private readonly writeBackend: VaultStorageBackend = objectStorage ? "s3" : "local",
   ) {
+    if (writeBackend === "s3" && !objectStorage) {
+      throw new InvalidVaultOperationError("Backend penulisan S3 dipilih tanpa konfigurasi object storage.");
+    }
     this.storagePath = path.resolve(storagePath);
     this.temporaryPath = path.join(this.storagePath, ".tmp");
     this.trashPath = path.join(this.storagePath, ".trash");
@@ -308,9 +339,10 @@ export class VaultService {
       const result = this.database
         .prepare(
           `INSERT INTO vault_items(
-             parent_id, kind, name, mime_type, size_bytes, storage_key, sha256,
+             parent_id, kind, name, mime_type, size_bytes, storage_key, storage_backend,
+             detected_mime_type, media_kind, source_file_unique_id, source_caption, sha256,
              source_chat_id, source_message_id
-           ) VALUES (?, 'file', ?, ?, ?, ?, ?, ?, ?)`,
+           ) VALUES (?, 'file', ?, ?, ?, ?, 'local', ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           parentId,
@@ -318,6 +350,10 @@ export class VaultService {
           input.mimeType ?? "application/octet-stream",
           bytes.byteLength,
           storageKey,
+          input.detectedMimeType ?? null,
+          input.mediaKind ?? null,
+          input.fileUniqueId ?? null,
+          input.sourceCaption?.trim().slice(0, 2_000) ?? null,
           createHash("sha256").update(bytes).digest("hex"),
           input.chatId ?? null,
           input.messageId ?? null,
@@ -330,6 +366,60 @@ export class VaultService {
     }
     this.forgetFilesystemOperation(operationId);
     return this.requireItem(itemId);
+  }
+
+  async saveFileObject(input: SaveVaultFileInput, signal?: AbortSignal): Promise<VaultItem> {
+    signal?.throwIfAborted();
+    if (this.writeBackend === "local") return this.saveFile(input);
+    const objectStorage = this.objectStorage;
+    if (!objectStorage) {
+      throw new InvalidVaultOperationError("Backend penulisan S3 tidak tersedia.");
+    }
+    const parentId = input.parentId ?? null;
+    this.assertFolder(parentId);
+    const name = normalizeVaultName(input.name);
+    const duplicate = this.findDuplicateName(name, parentId);
+    if (duplicate) throw new DuplicateVaultItemError(duplicate);
+    const bytes = Buffer.from(input.bytes);
+    if (bytes.byteLength === 0) throw new InvalidVaultOperationError("File kosong tidak dapat disimpan.");
+    const storageKey = randomUUID();
+    const operationId = randomUUID();
+    const mimeType = input.mimeType ?? "application/octet-stream";
+    this.recordObjectOperation(operationId, "put", storageKey);
+    try {
+      await objectStorage.put(storageKey, bytes, mimeType, signal);
+      const result = this.database
+        .prepare(
+          `INSERT INTO vault_items(
+             parent_id, kind, name, mime_type, size_bytes, storage_key, storage_backend,
+             detected_mime_type, media_kind, source_file_unique_id, source_caption, sha256,
+             source_chat_id, source_message_id
+           ) VALUES (?, 'file', ?, ?, ?, ?, 's3', ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          parentId,
+          name,
+          mimeType,
+          bytes.byteLength,
+          storageKey,
+          input.detectedMimeType ?? null,
+          input.mediaKind ?? null,
+          input.fileUniqueId ?? null,
+          input.sourceCaption?.trim().slice(0, 2_000) ?? null,
+          createHash("sha256").update(bytes).digest("hex"),
+          input.chatId ?? null,
+          input.messageId ?? null,
+        );
+      const item = this.requireItem(Number(result.lastInsertRowid));
+      this.forgetObjectOperation(operationId);
+      return item;
+    } catch (error) {
+      await objectStorage
+        .delete(storageKey, signal)
+        .then(() => this.forgetObjectOperation(operationId))
+        .catch(() => undefined);
+      throw error;
+    }
   }
 
   rename(id: number, name: string): VaultItem {
@@ -370,12 +460,13 @@ export class VaultService {
                UNION ALL
                SELECT child.id FROM vault_items child JOIN descendants parent ON child.parent_id = parent.id
              )
-             SELECT storage_key FROM vault_items WHERE id IN descendants AND storage_key IS NOT NULL`,
+             SELECT storage_key, storage_backend FROM vault_items
+             WHERE id IN descendants AND storage_key IS NOT NULL`,
           )
           .all(id)
       : item.storageKey
-        ? [{ storage_key: item.storageKey }]
-        : []) as Array<{ storage_key: string }>;
+        ? [{ storage_key: item.storageKey, storage_backend: item.storageBackend }]
+        : []) as Array<{ storage_key: string; storage_backend: VaultStorageBackend }>;
     const count =
       item.kind === "folder"
         ? (this.database
@@ -391,6 +482,7 @@ export class VaultService {
     const moves: VaultDeleteMove[] = [];
     try {
       for (const row of fileRows) {
+        if (row.storage_backend !== "local") continue;
         const finalPath = this.storageFilePath(row.storage_key);
         if (!fs.existsSync(finalPath)) continue;
         const operationId = randomUUID();
@@ -411,6 +503,80 @@ export class VaultService {
     return count;
   }
 
+  async deleteStored(id: number, signal?: AbortSignal): Promise<number> {
+    signal?.throwIfAborted();
+    const item = this.requireItem(id);
+    const s3Keys = (item.kind === "folder"
+      ? this.database
+          .prepare(
+            `WITH RECURSIVE descendants(id) AS (
+               SELECT id FROM vault_items WHERE id = ?
+               UNION ALL
+               SELECT child.id FROM vault_items child JOIN descendants parent ON child.parent_id = parent.id
+             )
+             SELECT storage_key FROM vault_items
+             WHERE id IN descendants AND storage_backend = 's3' AND storage_key IS NOT NULL`,
+          )
+          .all(id)
+      : item.storageBackend === "s3" && item.storageKey
+        ? [{ storage_key: item.storageKey }]
+        : []) as Array<{ storage_key: string }>;
+    if (s3Keys.length > 0 && !this.objectStorage) {
+      throw new InvalidVaultOperationError("Backend S3 belum dikonfigurasi; item tidak dihapus.");
+    }
+    const operations = s3Keys.map(({ storage_key }) => {
+      const operationId = randomUUID();
+      this.recordObjectOperation(operationId, "delete", storage_key);
+      return { operationId, storageKey: storage_key };
+    });
+    let count: number;
+    try {
+      count = this.delete(id);
+    } catch (error) {
+      for (const operation of operations) this.forgetObjectOperation(operation.operationId);
+      throw error;
+    }
+    if (this.objectStorage) {
+      await Promise.all(
+        operations.map(async ({ operationId, storageKey }) => {
+          try {
+            await this.objectStorage!.delete(storageKey, signal);
+            this.forgetObjectOperation(operationId);
+          } catch {
+            // Metadata is already gone. Keep the journal entry so startup can
+            // retry deleting this private orphan without losing user metadata.
+          }
+        }),
+      );
+    }
+    return count;
+  }
+
+  async reconcileObjectStorageOperations(signal?: AbortSignal): Promise<void> {
+    if (!this.objectStorage) return;
+    const operations = this.database
+      .prepare("SELECT id, operation, storage_key FROM vault_object_operations ORDER BY created_at, id")
+      .all() as VaultObjectOperationRow[];
+    for (const operation of operations) {
+      signal?.throwIfAborted();
+      const metadataExists = this.hasStorageMetadata(operation.storage_key);
+      if (
+        (operation.operation === "put" && metadataExists) ||
+        (operation.operation === "delete" && metadataExists)
+      ) {
+        this.forgetObjectOperation(operation.id);
+        continue;
+      }
+      try {
+        await this.objectStorage.delete(operation.storage_key, signal);
+        this.forgetObjectOperation(operation.id);
+      } catch {
+        // Retry on the next startup. The object is private and no metadata points
+        // to it, so leaving it temporarily is safer than deleting live metadata.
+      }
+    }
+  }
+
   search(query: string, limit = 30): VaultItem[] {
     const normalized = query.trim();
     if (!normalized) return [];
@@ -418,11 +584,12 @@ export class VaultService {
     const rows = this.database
       .prepare(
         `SELECT * FROM vault_items
-         WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE
-            OR content LIKE ? ESCAPE '\\' COLLATE NOCASE
+          WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE
+             OR content LIKE ? ESCAPE '\\' COLLATE NOCASE
+             OR source_caption LIKE ? ESCAPE '\\' COLLATE NOCASE
          ORDER BY updated_at DESC, id DESC LIMIT ?`,
       )
-      .all(pattern, pattern, limit) as VaultRow[];
+      .all(pattern, pattern, pattern, limit) as VaultRow[];
     return rows.map(mapRow);
   }
 
@@ -478,9 +645,38 @@ export class VaultService {
     if (item.kind !== "file" || !item.storageKey) {
       throw new InvalidVaultOperationError("Item bukan file.");
     }
+    if (item.storageBackend !== "local") {
+      throw new InvalidVaultOperationError("File berada di object storage dan tidak memiliki path lokal.");
+    }
     const filePath = this.storageFilePath(item.storageKey);
     if (!fs.existsSync(filePath)) throw new InvalidVaultOperationError("Byte file tidak ditemukan.");
     return filePath;
+  }
+
+  async fileBytes(id: number, signal?: AbortSignal): Promise<Uint8Array> {
+    signal?.throwIfAborted();
+    const item = this.requireItem(id);
+    if (item.kind !== "file" || !item.storageKey) {
+      throw new InvalidVaultOperationError("Item bukan file.");
+    }
+    const bytes =
+      item.storageBackend === "local"
+        ? new Uint8Array(await fs.promises.readFile(this.filePath(id)))
+        : this.objectStorage
+          ? await this.objectStorage.get(item.storageKey, signal)
+          : (() => {
+              throw new InvalidVaultOperationError("Backend S3 untuk file ini belum dikonfigurasi.");
+            })();
+    if (bytes.byteLength !== item.sizeBytes) {
+      throw new InvalidVaultOperationError("Ukuran byte file tidak cocok dengan metadata vault.");
+    }
+    if (item.sha256) {
+      const actual = createHash("sha256").update(bytes).digest("hex");
+      if (actual !== item.sha256) {
+        throw new InvalidVaultOperationError("Checksum file tidak cocok dengan metadata vault.");
+      }
+    }
+    return bytes;
   }
 
   private recordFilesystemOperation(
@@ -501,6 +697,26 @@ export class VaultService {
     } catch {
       // The completed operation is safe; a leftover journal row is idempotently
       // reconciled the next time VaultService starts.
+    }
+  }
+
+  private recordObjectOperation(
+    id: string,
+    operation: VaultObjectOperationRow["operation"],
+    storageKey: string,
+  ): void {
+    this.database
+      .prepare(
+        "INSERT INTO vault_object_operations(id, operation, storage_key) VALUES (?, ?, ?)",
+      )
+      .run(id, operation, storageKey);
+  }
+
+  private forgetObjectOperation(id: string): void {
+    try {
+      this.database.prepare("DELETE FROM vault_object_operations WHERE id = ?").run(id);
+    } catch {
+      // The operation is idempotent; startup reconciliation safely retries.
     }
   }
 

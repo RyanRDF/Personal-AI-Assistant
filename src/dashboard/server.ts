@@ -1,5 +1,4 @@
 import { timingSafeEqual } from "node:crypto";
-import fs from "node:fs";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import type Database from "better-sqlite3";
 import type { AppConfig } from "../config.js";
@@ -9,6 +8,7 @@ import {
   InvalidVaultOperationError,
   type VaultService,
 } from "../services/vault.js";
+import { validateAttachment } from "../services/attachments.js";
 import { observabilitySnapshot, parseObservabilityPeriod } from "./observability.js";
 import { dashboardPage } from "./page.js";
 
@@ -174,10 +174,24 @@ async function handleApi(
     const encodedName = request.headers["x-file-name"];
     if (typeof encodedName !== "string") throw new InvalidVaultOperationError("Nama file wajib diisi.");
     const bytes = await readBody(request, config.VAULT_MAX_FILE_BYTES);
-    const item = vault.saveFile({
-      name: decodeURIComponent(encodedName),
-      mimeType: request.headers["content-type"] ?? "application/octet-stream",
+    const fileName = decodeURIComponent(encodedName);
+    const claimedMimeType = request.headers["content-type"] ?? "application/octet-stream";
+    const validated = await validateAttachment(
+      {
+        kind: "document",
+        fileId: "dashboard-upload",
+        fileUniqueId: "dashboard-upload",
+        fileName,
+        claimedMimeType,
+      },
       bytes,
+    );
+    const item = await vault.saveFileObject({
+      name: fileName,
+      mimeType: validated.detectedMimeType,
+      detectedMimeType: validated.detectedMimeType,
+      mediaKind: "dashboard_upload",
+      bytes: validated.bytes,
       parentId: nullableId(request.headers["x-parent-id"]),
     });
     sendJson(response, 201, { item: publicItem(vault, item) });
@@ -191,21 +205,14 @@ async function handleApi(
   if (!item) throw new InvalidVaultOperationError(`Item vault ${id} tidak ditemukan.`);
   if (request.method === "GET" && itemMatch[2] === "/download") {
     if (item.kind !== "file") throw new InvalidVaultOperationError("Item bukan file.");
+    const bytes = await vault.fileBytes(id);
     response.writeHead(200, {
       "content-type": item.mimeType ?? "application/octet-stream",
       "content-length": item.sizeBytes,
       "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(item.name)}`,
       "x-content-type-options": "nosniff",
     });
-    const stream = fs.createReadStream(vault.filePath(id));
-    stream.on("error", (error) => {
-      dependencies.logger.warn(
-        { itemId: id, errorMessage: safeErrorMessage(error) },
-        "Vault download stream failed",
-      );
-      response.destroy(error);
-    });
-    stream.pipe(response);
+    response.end(bytes);
     return true;
   }
   if (request.method === "PATCH" && !itemMatch[2]) {
@@ -226,7 +233,7 @@ async function handleApi(
     return true;
   }
   if (request.method === "DELETE" && !itemMatch[2]) {
-    sendJson(response, 200, { deleted: vault.delete(id) });
+    sendJson(response, 200, { deleted: await vault.deleteStored(id) });
     return true;
   }
   return false;

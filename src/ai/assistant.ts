@@ -307,6 +307,7 @@ export type AssistantEvent =
 export interface AssistantReplyOptions {
   signal?: AbortSignal;
   onEvent?: (event: AssistantEvent) => void;
+  isolated?: boolean;
 }
 
 interface StreamedCompletion {
@@ -548,6 +549,7 @@ export class PersonalAssistant {
     options: AssistantReplyOptions = {},
   ): Promise<string> {
     options.signal?.throwIfAborted();
+    const isolated = options.isolated ?? false;
     const normalized = typeof input === "string" ? { text: input, images: [] } : input;
     const userText = normalized.text.trim() || "Analisis gambar ini dan jelaskan temuan pentingnya.";
     const parsedUserText = parseUserText(userText);
@@ -564,31 +566,24 @@ export class PersonalAssistant {
     const storedText = images.length || normalized.attachmentContext
       ? `${modelUserText}\n[${images.length ? `${images.length} gambar dilampirkan; ` : ""}Attachment diproses pada pesan ini; byte dan hasil ekstraksi tidak disimpan di riwayat chat.]`
       : modelUserText;
-    const storedMessage = this.dependencies.conversations.add(chatId, "user", storedText);
-    const memories = this.dependencies.memories.relevant(
-      userText,
-      this.config.MAX_MEMORY_ITEMS,
-    );
-    const vaultContext = this.dependencies.vault.relevant(
-      userText,
-      this.config.MAX_VAULT_CONTEXT_ITEMS,
-    );
-    const history = limitConversationHistory(
-      this.dependencies.conversations.recent(chatId, this.config.MAX_HISTORY_MESSAGES),
-      this.config.MAX_HISTORY_CHARS,
-    );
-    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-      {
-        role: "system",
-        content: buildSystemPrompt(this.config.TIMEZONE),
-      },
-      {
-        role: "user",
-        content: buildUntrustedPersonalContext(memories, vaultContext),
-      },
-      ...history.map((message): OpenAI.Chat.Completions.ChatCompletionMessageParam => {
-        if (message.id === storedMessage.id && (images.length > 0 || normalized.attachmentContext)) {
-          return {
+    const storedMessage = isolated
+      ? null
+      : this.dependencies.conversations.add(chatId, "user", storedText);
+    const memories = isolated
+      ? []
+      : this.dependencies.memories.relevant(userText, this.config.MAX_MEMORY_ITEMS);
+    const vaultContext = isolated
+      ? []
+      : this.dependencies.vault.relevant(userText, this.config.MAX_VAULT_CONTEXT_ITEMS);
+    const history = isolated
+      ? []
+      : limitConversationHistory(
+          this.dependencies.conversations.recent(chatId, this.config.MAX_HISTORY_MESSAGES),
+          this.config.MAX_HISTORY_CHARS,
+        );
+    const currentMessage: OpenAI.Chat.Completions.ChatCompletionMessageParam =
+      images.length > 0 || normalized.attachmentContext
+        ? {
             role: "user",
             content: [
               { type: "text", text: modelTextWithAttachment },
@@ -599,14 +594,34 @@ export class PersonalAssistant {
                 }),
               ),
             ],
-          };
-        }
-        return { role: message.role, content: message.content };
-      }),
+          }
+        : { role: "user", content: modelUserText };
+    const conversationMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = isolated
+      ? [currentMessage]
+      : history.map((message): OpenAI.Chat.Completions.ChatCompletionMessageParam => {
+          if (
+            storedMessage &&
+            message.id === storedMessage.id &&
+            (images.length > 0 || normalized.attachmentContext)
+          ) {
+            return currentMessage;
+          }
+          return { role: message.role, content: message.content };
+        });
+    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+      {
+        role: "system",
+        content: buildSystemPrompt(this.config.TIMEZONE),
+      },
+      {
+        role: "user",
+        content: buildUntrustedPersonalContext(memories, vaultContext),
+      },
+      ...conversationMessages,
     ];
     const authorization = authorizeParsedUserText(parsedUserText);
-    if (images.length > 0 || normalized.attachmentContext) {
-      // Attachment content is untrusted and is analyzed without privileged tools.
+    if (isolated || images.length > 0 || normalized.attachmentContext) {
+      // Transient batches and attachment content are untrusted and analyzed without tools.
       authorization.allowedTools.clear();
       authorization.vaultWriteMode = "none";
     }
@@ -642,11 +657,13 @@ export class PersonalAssistant {
         const answer =
           (typeof responseMessage.content === "string" ? responseMessage.content.trim() : "") ||
           "Maaf, saya belum dapat menjawabnya.";
-        this.dependencies.conversations.add(
-          chatId,
-          "assistant",
-          authorization.sensitiveVaultRead ? SENSITIVE_VAULT_HISTORY_MARKER : answer,
-        );
+        if (!isolated) {
+          this.dependencies.conversations.add(
+            chatId,
+            "assistant",
+            authorization.sensitiveVaultRead ? SENSITIVE_VAULT_HISTORY_MARKER : answer,
+          );
+        }
         return answer;
       }
 

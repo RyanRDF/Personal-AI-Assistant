@@ -415,7 +415,7 @@ Ada tiga cara mengirim attachment:
 
 1. Kirim attachment dengan caption pertanyaan; bot langsung menyimpan dan menganalisisnya.
 2. Kirim foto tanpa caption; setelah bot mengonfirmasi penerimaan, kirim pertanyaan teks dalam 10 menit.
-3. Forward attachment tanpa caption; bot menyimpan lalu langsung menganalisisnya. Forward beberapa chat teks dalam satu kiriman akan digabung menjadi satu batch, disimpan sebagai satu note, lalu diringkas agar tidak saling ditolak sebagai request sibuk.
+3. Forward attachment tanpa caption; bot menyimpan lalu langsung menganalisisnya. Forward beberapa chat teks dalam satu kiriman akan digabung menjadi satu batch, diringkas tanpa membawa riwayat chat lama, lalu hanya hasil final AI yang disimpan sebagai note agar payload mentah tidak memenuhi vault.
 
 Bot mengambil resolusi foto terbesar. Dokumen yang didukung dikirim sebagai file input, audio ditranskripsikan, dan video diproses menjadi maksimal sejumlah frame serta audio melalui FFmpeg. URL unduhan Telegram yang mengandung bot token tidak ditulis ke log. Byte mentah disimpan di backend Vault, bukan SQLite; riwayat chat hanya menyimpan caption dan marker attachment.
 

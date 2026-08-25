@@ -113,6 +113,11 @@ interface PreparedAssistantInput {
   footer?: string;
 }
 
+interface AssistantRequestBehavior {
+  isolated?: boolean;
+  afterAnswer?: (answer: string) => Promise<string | undefined>;
+}
+
 interface ForwardedTextPart {
   ctx: Context;
   text: string;
@@ -323,6 +328,20 @@ function generatedNoteName(text: string, messageId: number): string {
 
 function generatedPhotoName(messageId: number): string {
   return `Foto Telegram ${messageId}.jpg`;
+}
+
+function generatedForwardSummaryName(answer: string, messageId: number): string {
+  const firstLine = answer
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .find(Boolean)
+    ?.replace(/^#{1,6}\s*/u, "")
+    .replace(/^judul\s*:\s*/iu, "")
+    .replace(/[\\/\u0000-\u001f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 120);
+  return firstLine || `Ringkasan Chat Telegram ${messageId}`;
 }
 
 async function downloadTelegramFile(
@@ -628,25 +647,29 @@ export function createTelegramBot(
     const latest = batch.parts.at(-1)!;
     scheduleAssistantWork(chatId, async () => {
       const content = forwardedBatchContent(batch.parts);
-      const defaultName = generatedNoteName(first.text, first.messageId);
-      let footer: string;
-      try {
-        const noteName = dependencies.vault.findDuplicateName(defaultName, null)
-          ? `${defaultName} (Telegram ${first.messageId})`
-          : defaultName;
-        const item = dependencies.vault.saveNote(noteName, content, null, {
-          chatId,
-          messageId: String(first.messageId),
-        });
-        footer = `✅ ${batch.parts.length} chat diteruskan disimpan sebagai ${dependencies.vault.pathFor(item.id)} (#${item.id}).`;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Chat gagal disimpan.";
-        footer = `⚠️ Chat diteruskan tetap dianalisis, tetapi gagal disimpan: ${message}`;
-      }
       await processAssistantRequest(
         latest.ctx,
-        `Ringkas dan analisis ${batch.parts.length} chat yang diteruskan berikut. Pertahankan angka, tanggal, keputusan, dan koreksi penting.\n${content}`,
-        { footer },
+        `Susun satu hasil final bersih dari ${batch.parts.length} chat yang diteruskan; gunakan hanya fakta dan koreksi final, buang jawaban antara yang sudah digantikan, jangan ulangi percakapan mentah, jangan membahas keterbatasan sistem, jangan memberi pertanyaan atau pilihan lanjutan, dan awali dengan "Judul: <judul singkat yang spesifik>".\n${content}`,
+        undefined,
+        {
+          isolated: true,
+          afterAnswer: async (answer) => {
+            try {
+              const defaultName = generatedForwardSummaryName(answer, first.messageId);
+              const noteName = dependencies.vault.findDuplicateName(defaultName, null)
+                ? `${defaultName.slice(0, 90)} (Telegram ${first.messageId})`
+                : defaultName;
+              const item = dependencies.vault.saveNote(noteName, answer, null, {
+                chatId,
+                messageId: String(first.messageId),
+              });
+              return `✅ Hasil final ${batch.parts.length} chat diteruskan disimpan sebagai ${dependencies.vault.pathFor(item.id)} (#${item.id}).`;
+            } catch (error) {
+              const message = error instanceof Error ? error.message : "Hasil gagal disimpan.";
+              return `⚠️ Ringkasan selesai, tetapi gagal disimpan ke vault: ${message}`;
+            }
+          },
+        },
       );
     });
   }
@@ -780,6 +803,7 @@ export function createTelegramBot(
     ctx: Context,
     text: string,
     inputSource?: AssistantInputSource,
+    behavior: AssistantRequestBehavior = {},
   ): Promise<void> {
     const chatId = String(ctx.chat!.id);
     const existing = activeRequests.get(chatId);
@@ -921,11 +945,19 @@ export function createTelegramBot(
               ...(prepared.attachmentContext ? { attachmentContext: prepared.attachmentContext } : {}),
             }
           : text,
-        { signal: active.controller.signal, onEvent },
+        {
+          signal: active.controller.signal,
+          onEvent,
+          ...(behavior.isolated ? { isolated: true } : {}),
+        },
       );
+      const generatedFooter = await behavior.afterAnswer?.(answer);
       dependencies.traces.addStage(trace.requestId, "answer_ready", "Jawaban siap");
       const completedTrace = dependencies.traces.finish(trace.requestId, "completed")!;
-      const finalAnswer = prepared.footer ? `${answer}\n\n${prepared.footer}` : answer;
+      const footers = [prepared.footer, generatedFooter].filter(
+        (value): value is string => Boolean(value),
+      );
+      const finalAnswer = footers.length > 0 ? `${answer}\n\n${footers.join("\n")}` : answer;
       const chunks = splitTelegramMessage(finalAnswer);
       if (liveTrace) {
         await progress.finish(`✅ Selesai\n\n${formatRequestTrace(completedTrace)}`);

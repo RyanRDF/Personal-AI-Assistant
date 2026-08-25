@@ -411,13 +411,14 @@ describe("Telegram safety and formatting", () => {
     );
   });
 
-  it("batches forwarded text into one saved note and one assistant request", async () => {
+  it("batches forwarded text and saves only the isolated AI result", async () => {
     vi.useFakeTimers();
     const firstReply = deferred<string>();
+    const summary = "Judul: Ringkasan Pengeluaran Agustus\n\nTotal final Rp715.000.";
     const assistantReply = vi
       .fn()
       .mockImplementationOnce(() => firstReply.promise)
-      .mockResolvedValue("Ringkasan gabungan.");
+      .mockResolvedValue(summary);
     const saveNote = vi.fn().mockReturnValue({ id: 21 });
     const trace = {
       requestId: "forward1-request",
@@ -507,15 +508,20 @@ describe("Telegram safety and formatting", () => {
     await bot.handleUpdate(forwarded(102, "Koreksi total menjadi Rp631.000"));
     await vi.advanceTimersByTimeAsync(800);
     expect(assistantReply).toHaveBeenCalledOnce();
+    expect(saveNote).not.toHaveBeenCalled();
     firstReply.resolve("Permintaan awal selesai.");
     await activeHandling;
     await vi.waitFor(() => expect(assistantReply).toHaveBeenCalledTimes(2));
 
     expect(saveNote).toHaveBeenCalledOnce();
-    expect(saveNote.mock.calls[0]?.[1]).toContain("Pengeluaran 21 Agustus Rp457.000");
-    expect(saveNote.mock.calls[0]?.[1]).toContain("Koreksi total menjadi Rp631.000");
+    expect(saveNote.mock.calls[0]?.[0]).toBe("Ringkasan Pengeluaran Agustus");
+    expect(saveNote.mock.calls[0]?.[1]).toBe(summary);
+    expect(saveNote.mock.calls[0]?.[1]).not.toContain("Pengeluaran 21 Agustus Rp457.000");
     expect(assistantReply.mock.calls[1]?.[1]).toEqual(
       expect.stringContaining("Koreksi total menjadi Rp631.000"),
+    );
+    expect(assistantReply.mock.calls[1]?.[2]).toEqual(
+      expect.objectContaining({ isolated: true }),
     );
   });
 

@@ -206,6 +206,7 @@ Salin `.env.example` menjadi `.env`, lalu ubah hanya nilai yang diperlukan. Nila
 | `LOG_LEVEL` | Tidak | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, atau `silent` |
 | `TIMEZONE` | Tidak | IANA timezone; default `Asia/Jakarta` |
 | `MAX_HISTORY_MESSAGES` | Tidak | Jumlah pesan recent context; default `16` |
+| `MAX_HISTORY_CHARS` | Tidak | Batas karakter recent context untuk mencegah payload model terlalu besar; default `60000` |
 | `MAX_MEMORY_ITEMS` | Tidak | Maksimum memory context; default `20` |
 | `MESSAGE_RETENTION_DAYS` | Tidak | Retensi chat dan trace; default `90` hari |
 
@@ -410,10 +411,11 @@ Status aplikasi membaca data nyata dari `request_traces` dan `usage_events`, tid
 
 ## Analisis attachment dan trace
 
-Ada dua cara mengirim gambar:
+Ada tiga cara mengirim attachment:
 
-1. Kirim foto dengan caption pertanyaan; bot langsung menganalisisnya.
+1. Kirim attachment dengan caption pertanyaan; bot langsung menyimpan dan menganalisisnya.
 2. Kirim foto tanpa caption; setelah bot mengonfirmasi penerimaan, kirim pertanyaan teks dalam 10 menit.
+3. Forward attachment tanpa caption; bot menyimpan lalu langsung menganalisisnya. Forward beberapa chat teks dalam satu kiriman akan digabung menjadi satu batch, disimpan sebagai satu note, lalu diringkas agar tidak saling ditolak sebagai request sibuk.
 
 Bot mengambil resolusi foto terbesar. Dokumen yang didukung dikirim sebagai file input, audio ditranskripsikan, dan video diproses menjadi maksimal sejumlah frame serta audio melalui FFmpeg. URL unduhan Telegram yang mengandung bot token tidak ditulis ke log. Byte mentah disimpan di backend Vault, bukan SQLite; riwayat chat hanya menyimpan caption dan marker attachment.
 

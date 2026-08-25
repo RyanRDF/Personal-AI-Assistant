@@ -62,6 +62,7 @@ const envSchema = z.object({
     .default("info"),
   TIMEZONE: z.string().trim().min(1).default("Asia/Jakarta"),
   MAX_HISTORY_MESSAGES: z.coerce.number().int().min(2).max(50).default(16),
+  MAX_HISTORY_CHARS: z.coerce.number().int().min(4_000).max(500_000).default(60_000),
   MAX_MEMORY_ITEMS: z.coerce.number().int().min(1).max(100).default(20),
   MESSAGE_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
   GMAIL_CLIENT_ID: optionalTrimmedString,

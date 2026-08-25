@@ -1,6 +1,10 @@
 import type OpenAI from "openai";
 import { describe, expect, it, vi } from "vitest";
-import { PersonalAssistant, type AssistantEvent } from "../src/ai/assistant.js";
+import {
+  limitConversationHistory,
+  PersonalAssistant,
+  type AssistantEvent,
+} from "../src/ai/assistant.js";
 import { createLogger } from "../src/logger.js";
 import { ConversationService } from "../src/services/conversation.js";
 import { EmailRuleService } from "../src/services/email-rules.js";
@@ -17,6 +21,17 @@ function fakeStream(chunks: unknown[]): AsyncIterable<unknown> {
 }
 
 describe("assistant vision input", () => {
+  it("keeps the newest turn while bounding long conversation history", () => {
+    const messages = [
+      { id: 1, chatId: "owner", role: "user" as const, content: "a".repeat(40), createdAt: "" },
+      { id: 2, chatId: "owner", role: "assistant" as const, content: "b".repeat(40), createdAt: "" },
+      { id: 3, chatId: "owner", role: "user" as const, content: "c".repeat(40), createdAt: "" },
+    ];
+
+    expect(limitConversationHistory(messages, 85).map(({ id }) => id)).toEqual([2, 3]);
+    expect(limitConversationHistory(messages, 10).map(({ id }) => id)).toEqual([3]);
+  });
+
   it("sends image data to OpenAI but stores only a non-sensitive marker", async () => {
     const { database, directory, cleanup } = temporaryDatabase();
     try {

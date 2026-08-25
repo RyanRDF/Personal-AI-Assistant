@@ -411,6 +411,234 @@ describe("Telegram safety and formatting", () => {
     );
   });
 
+  it("batches forwarded text into one saved note and one assistant request", async () => {
+    vi.useFakeTimers();
+    const firstReply = deferred<string>();
+    const assistantReply = vi
+      .fn()
+      .mockImplementationOnce(() => firstReply.promise)
+      .mockResolvedValue("Ringkasan gabungan.");
+    const saveNote = vi.fn().mockReturnValue({ id: 21 });
+    const trace = {
+      requestId: "forward1-request",
+      chatId: "123456",
+      model: "test-model",
+      inputKind: "text" as const,
+      startedAt: Date.now(),
+      stages: [],
+      tools: [],
+      inputTokens: 0,
+      outputTokens: 0,
+    };
+    const bot = createTelegramBot(
+      testConfig(),
+      createLogger({ LOG_LEVEL: "silent" }),
+      {
+        assistant: { reply: assistantReply },
+        conversations: {},
+        memories: {},
+        vault: {
+          findDuplicateName: vi.fn(() => null),
+          saveNote,
+          pathFor: vi.fn(() => "/Chat Bandung"),
+        },
+        emailRules: {},
+        search: { available: false, name: "none" },
+        traces: {
+          start: vi.fn(() => trace),
+          isLiveEnabled: vi.fn(() => false),
+          addStage: vi.fn(),
+          addTool: vi.fn(),
+          addUsage: vi.fn(),
+          finish: vi.fn(() => trace),
+        },
+        telegramHistory: { record: vi.fn() },
+        gmailConfigured: false,
+      } as never,
+    );
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: "Test",
+      username: "test_bot",
+    } as never;
+    let sentMessageId = 300;
+    bot.api.config.use(async (_previous, method) => {
+      if (method === "sendChatAction") return { ok: true, result: true } as never;
+      sentMessageId += 1;
+      return {
+        ok: true,
+        result: {
+          message_id: sentMessageId,
+          date: 1_700_000_000,
+          chat: { id: 123456, type: "private" },
+          text: "ok",
+        },
+      } as never;
+    });
+    const forwarded = (messageId: number, text: string) => ({
+      update_id: messageId,
+      message: {
+        message_id: messageId,
+        date: 1_700_000_000,
+        chat: { id: 123456, type: "private" as const, first_name: "Owner" },
+        from: { id: 123456, is_bot: false, first_name: "Owner" },
+        forward_origin: {
+          type: "user" as const,
+          sender_user: { id: 42, is_bot: false, first_name: "Sumber" },
+          date: 1_699_999_000,
+        },
+        text,
+      },
+    });
+
+    const activeHandling = bot.handleUpdate({
+      update_id: 100,
+      message: {
+        message_id: 100,
+        date: 1_700_000_000,
+        chat: { id: 123456, type: "private", first_name: "Owner" },
+        from: { id: 123456, is_bot: false, first_name: "Owner" },
+        text: "Permintaan yang sedang berjalan",
+      },
+    });
+    await vi.waitFor(() => expect(assistantReply).toHaveBeenCalledOnce());
+    await bot.handleUpdate(forwarded(101, "Pengeluaran 21 Agustus Rp457.000"));
+    await bot.handleUpdate(forwarded(102, "Koreksi total menjadi Rp631.000"));
+    await vi.advanceTimersByTimeAsync(800);
+    expect(assistantReply).toHaveBeenCalledOnce();
+    firstReply.resolve("Permintaan awal selesai.");
+    await activeHandling;
+    await vi.waitFor(() => expect(assistantReply).toHaveBeenCalledTimes(2));
+
+    expect(saveNote).toHaveBeenCalledOnce();
+    expect(saveNote.mock.calls[0]?.[1]).toContain("Pengeluaran 21 Agustus Rp457.000");
+    expect(saveNote.mock.calls[0]?.[1]).toContain("Koreksi total menjadi Rp631.000");
+    expect(assistantReply.mock.calls[1]?.[1]).toEqual(
+      expect.stringContaining("Koreksi total menjadi Rp631.000"),
+    );
+  });
+
+  it("stores and analyzes a forwarded document instead of using save-only mode", async () => {
+    const assistantReply = vi.fn().mockResolvedValue("Dokumen berisi catatan pengeluaran.");
+    const saveFileObject = vi.fn().mockResolvedValue({
+      id: 22,
+      name: "pengeluaran.csv",
+      detectedMimeType: "text/csv",
+      mimeType: "text/csv",
+      sizeBytes: 32,
+      storageBackend: "s3",
+    });
+    const trace = {
+      requestId: "forward2-request",
+      chatId: "123456",
+      model: "test-model",
+      inputKind: "image" as const,
+      startedAt: Date.now(),
+      stages: [],
+      tools: [],
+      inputTokens: 0,
+      outputTokens: 0,
+    };
+    const bot = createTelegramBot(
+      testConfig({ ATTACHMENT_ANALYSIS_ENABLED: "false" }),
+      createLogger({ LOG_LEVEL: "silent" }),
+      {
+        assistant: { reply: assistantReply, openaiClient: {} },
+        conversations: {},
+        memories: {},
+        vault: {
+          findDuplicateName: vi.fn(() => null),
+          saveFileObject,
+          pathFor: vi.fn(() => "/pengeluaran.csv"),
+        },
+        emailRules: {},
+        search: { available: false, name: "none" },
+        traces: {
+          start: vi.fn(() => trace),
+          isLiveEnabled: vi.fn(() => false),
+          addStage: vi.fn(),
+          addTool: vi.fn(),
+          addUsage: vi.fn(),
+          finish: vi.fn(() => trace),
+        },
+        telegramHistory: { record: vi.fn() },
+        gmailConfigured: false,
+      } as never,
+    );
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: "Test",
+      username: "test_bot",
+    } as never;
+    const csv = new TextEncoder().encode("tanggal,jumlah\n2026-08-21,457000");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(csv, {
+      status: 200,
+      headers: { "content-type": "text/csv", "content-length": String(csv.byteLength) },
+    })));
+    let sentMessageId = 400;
+    bot.api.config.use(async (_previous, method) => {
+      if (method === "getFile") {
+        return {
+          ok: true,
+          result: {
+            file_id: "document-file",
+            file_unique_id: "document-unique",
+            file_size: csv.byteLength,
+            file_path: "pengeluaran.csv",
+          },
+        } as never;
+      }
+      if (method === "sendChatAction") return { ok: true, result: true } as never;
+      sentMessageId += 1;
+      return {
+        ok: true,
+        result: {
+          message_id: sentMessageId,
+          date: 1_700_000_000,
+          chat: { id: 123456, type: "private" },
+          text: "ok",
+        },
+      } as never;
+    });
+
+    await bot.handleUpdate({
+      update_id: 200,
+      message: {
+        message_id: 200,
+        date: 1_700_000_000,
+        chat: { id: 123456, type: "private", first_name: "Owner" },
+        from: { id: 123456, is_bot: false, first_name: "Owner" },
+        forward_origin: {
+          type: "user",
+          sender_user: { id: 42, is_bot: false, first_name: "Sumber" },
+          date: 1_699_999_000,
+        },
+        document: {
+          file_id: "document-file",
+          file_unique_id: "document-unique",
+          file_name: "pengeluaran.csv",
+          mime_type: "text/csv",
+          file_size: csv.byteLength,
+        },
+      },
+    });
+    await vi.waitFor(() => expect(assistantReply).toHaveBeenCalledOnce());
+
+    expect(saveFileObject).toHaveBeenCalledOnce();
+    expect(assistantReply).toHaveBeenCalledWith(
+      "123456",
+      expect.objectContaining({
+        text: "Analisis document ini dan jelaskan temuan pentingnya.",
+        attachmentContext: expect.objectContaining({
+          vault: expect.objectContaining({ saved: true, id: 22 }),
+        }),
+      }),
+      expect.any(Object),
+    );
+  });
+
   it("propagates deadline signals through assistant replies, typing, edits, chunks, and files", async () => {
     const calls: Array<{ method: string; signal: unknown }> = [];
     const trace = {

@@ -11,6 +11,7 @@ import type { GmailService } from "../services/gmail.js";
 import type { MemoryService } from "../services/memory.js";
 import type { VaultService } from "../services/vault.js";
 import { formatSearchResults, type WebSearchProvider } from "../services/web-search.js";
+import type { StoredMessage } from "../types.js";
 import { buildSystemPrompt, buildUntrustedPersonalContext } from "./prompts.js";
 
 const memoryKindSchema = z.enum(["preference", "fact", "commitment", "other"]);
@@ -500,6 +501,21 @@ function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<
   });
 }
 
+export function limitConversationHistory(
+  messages: StoredMessage[],
+  maximumCharacters: number,
+): StoredMessage[] {
+  const selected: StoredMessage[] = [];
+  let usedCharacters = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (selected.length > 0 && usedCharacters + message.content.length > maximumCharacters) break;
+    selected.push(message);
+    usedCharacters += message.content.length;
+  }
+  return selected.reverse();
+}
+
 interface AssistantDependencies {
   conversations: ConversationService;
   memories: MemoryService;
@@ -557,9 +573,9 @@ export class PersonalAssistant {
       userText,
       this.config.MAX_VAULT_CONTEXT_ITEMS,
     );
-    const history = this.dependencies.conversations.recent(
-      chatId,
-      this.config.MAX_HISTORY_MESSAGES,
+    const history = limitConversationHistory(
+      this.dependencies.conversations.recent(chatId, this.config.MAX_HISTORY_MESSAGES),
+      this.config.MAX_HISTORY_CHARS,
     );
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
       {

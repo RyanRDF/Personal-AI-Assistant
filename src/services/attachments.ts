@@ -28,6 +28,7 @@ export interface IncomingAttachment {
   fileSize?: number;
   durationSeconds?: number;
   caption?: string;
+  forwarded?: boolean;
 }
 
 export type AttachmentAnalysisKind = "image" | "document" | "audio" | "video" | "store-only";

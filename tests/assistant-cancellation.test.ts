@@ -5,7 +5,7 @@ import { createLogger } from "../src/logger.js";
 import { ConversationService } from "../src/services/conversation.js";
 import { EmailRuleService } from "../src/services/email-rules.js";
 import { MemoryService } from "../src/services/memory.js";
-import { VaultService } from "../src/services/vault.js";
+import { openVault } from "../src/services/vault.js";
 import { temporaryDatabase, testConfig } from "./helpers.js";
 
 function fakeStream(chunks: unknown[]): AsyncIterable<unknown> {
@@ -33,7 +33,7 @@ describe("assistant cancellation", () => {
         {
           conversations: new ConversationService(setup.database),
           memories: new MemoryService(setup.database),
-          vault: new VaultService(setup.database, `${setup.directory}/vault`),
+          vault: await openVault(setup.database, `${setup.directory}/vault`),
           emailRules: new EmailRuleService(setup.database),
           gmail: null,
           search: { name: "test", available: false, async search() { return []; } },
@@ -90,7 +90,7 @@ describe("assistant cancellation", () => {
         {
           conversations: new ConversationService(setup.database),
           memories: new MemoryService(setup.database),
-          vault: new VaultService(setup.database, `${setup.directory}/vault`),
+          vault: await openVault(setup.database, `${setup.directory}/vault`),
           emailRules: new EmailRuleService(setup.database),
           gmail: null,
           search: { name: "test", available: true, search },
@@ -147,7 +147,7 @@ describe("assistant cancellation", () => {
         {
           conversations: new ConversationService(setup.database),
           memories: new MemoryService(setup.database),
-          vault: new VaultService(setup.database, `${setup.directory}/vault`),
+          vault: await openVault(setup.database, `${setup.directory}/vault`),
           emailRules: new EmailRuleService(setup.database),
           gmail: { search: gmailSearch } as never,
           search: { name: "test", available: false, async search() { return []; } },

@@ -289,21 +289,19 @@ describe("Telegram safety and formatting", () => {
 
   it("stores and responds to a captioned video instead of silently dropping it", async () => {
     const assistantReply = vi.fn().mockResolvedValue("Saya berhasil membaca video servis.");
-    const saveFileObject = vi.fn().mockResolvedValue({
+    const saveFile = vi.fn().mockResolvedValue({
       id: 12,
       parentId: null,
       kind: "file",
       name: "Video Telegram 100.mp4",
+      path: "/Video Telegram 100.mp4",
       mimeType: "video/mp4",
       detectedMimeType: "video/mp4",
       mediaKind: "video",
       sizeBytes: 24,
-      storageKey: "11111111-1111-4111-8111-111111111111",
-      storageBackend: "s3",
       sourceFileUniqueId: "video-unique",
       sourceCaption: "Simpan video ini ke Vault sebagai bukti servis motor seharga 1.2jt",
       content: null,
-      sha256: "0".repeat(64),
       sourceChatId: "123456",
       sourceMessageId: "100",
       createdAt: "2026-08-25 00:00:00",
@@ -329,7 +327,7 @@ describe("Telegram safety and formatting", () => {
         memories: {},
         vault: {
           findDuplicateName: vi.fn(() => null),
-          saveFileObject,
+          saveFile,
           pathFor: vi.fn(() => "/Video Telegram 100.mp4"),
         },
         emailRules: {},
@@ -398,13 +396,13 @@ describe("Telegram safety and formatting", () => {
       },
     });
 
-    expect(saveFileObject).toHaveBeenCalledOnce();
+    expect(saveFile).toHaveBeenCalledOnce();
     expect(assistantReply).toHaveBeenCalledWith(
       "123456",
       expect.objectContaining({
         text: "Simpan video ini ke Vault sebagai bukti servis motor seharga 1.2jt",
         attachmentContext: expect.objectContaining({
-          vault: expect.objectContaining({ saved: true, id: 12, backend: "s3" }),
+          vault: { saved: true, id: 12, path: "/Video Telegram 100.mp4" },
         }),
       }),
       expect.any(Object),
@@ -527,13 +525,13 @@ describe("Telegram safety and formatting", () => {
 
   it("stores and analyzes a forwarded document instead of using save-only mode", async () => {
     const assistantReply = vi.fn().mockResolvedValue("Dokumen berisi catatan pengeluaran.");
-    const saveFileObject = vi.fn().mockResolvedValue({
+    const saveFile = vi.fn().mockResolvedValue({
       id: 22,
       name: "pengeluaran.csv",
+      path: "/pengeluaran.csv",
       detectedMimeType: "text/csv",
       mimeType: "text/csv",
       sizeBytes: 32,
-      storageBackend: "s3",
     });
     const trace = {
       requestId: "forward2-request",
@@ -555,7 +553,7 @@ describe("Telegram safety and formatting", () => {
         memories: {},
         vault: {
           findDuplicateName: vi.fn(() => null),
-          saveFileObject,
+          saveFile,
           pathFor: vi.fn(() => "/pengeluaran.csv"),
         },
         emailRules: {},
@@ -632,7 +630,7 @@ describe("Telegram safety and formatting", () => {
     });
     await vi.waitFor(() => expect(assistantReply).toHaveBeenCalledOnce());
 
-    expect(saveFileObject).toHaveBeenCalledOnce();
+    expect(saveFile).toHaveBeenCalledOnce();
     expect(assistantReply).toHaveBeenCalledWith(
       "123456",
       expect.objectContaining({
@@ -677,8 +675,14 @@ describe("Telegram safety and formatting", () => {
             name: "hasil.txt",
             sizeBytes: 12,
           })),
-          filePath: vi.fn(() => "C:\\tmp\\hasil.txt"),
-          pathFor: vi.fn(() => "/hasil.txt"),
+          readFile: vi.fn(async () => ({
+            id: 7,
+            kind: "file",
+            name: "hasil.txt",
+            sizeBytes: 12,
+            path: "/hasil.txt",
+            bytes: Buffer.from("hasil file"),
+          })),
         },
         emailRules: {},
         search: { available: false, name: "none" },

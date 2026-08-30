@@ -13,7 +13,7 @@ import type { MemoryService } from "../services/memory.js";
 import {
   DuplicateVaultItemError,
   InvalidVaultOperationError,
-  type VaultService,
+  type Vault,
 } from "../services/vault.js";
 import {
   formatRequestTrace,
@@ -86,7 +86,7 @@ interface BotDependencies {
   assistant: PersonalAssistant;
   conversations: ConversationService;
   memories: MemoryService;
-  vault: VaultService;
+  vault: Vault;
   emailRules: EmailRuleService;
   search: WebSearchProvider;
   traces: RequestTraceService;
@@ -719,14 +719,12 @@ export function createTelegramBot(
       );
       return;
     }
-    const inputFile =
-      item.storageBackend === "s3"
-        ? new InputFile(await dependencies.vault.fileBytes(item.id, callOptions.signal), item.name)
-        : new InputFile(dependencies.vault.filePath(item.id), item.name);
+    const file = await dependencies.vault.readFile(item.id, callOptions.signal);
+    const inputFile = new InputFile(file.bytes, file.name);
     await awaitTelegramCall(
       (signal) =>
         ctx.replyWithDocument(inputFile, {
-          caption: `📎 ${dependencies.vault.pathFor(item.id)} · ${formatBytes(item.sizeBytes)}`,
+          caption: `📎 ${file.path} · ${formatBytes(file.sizeBytes)}`,
         }, asGrammySignal(signal)),
       callOptions,
     );
@@ -768,7 +766,7 @@ export function createTelegramBot(
         ...(input.fileSize ? { fileSize: input.fileSize } : {}),
         ...(input.durationSeconds ? { durationSeconds: input.durationSeconds } : {}),
       }, bytes);
-      const item = await dependencies.vault.saveFileObject({
+      const item = await dependencies.vault.saveFile({
         name: validated.attachment.fileName,
         mimeType: validated.detectedMimeType,
         detectedMimeType: validated.detectedMimeType,
@@ -779,7 +777,7 @@ export function createTelegramBot(
         chatId: String(ctx.chat!.id),
         messageId: String(ctx.message?.message_id ?? ""),
       });
-      acknowledgement = `✅ File disimpan: ${dependencies.vault.pathFor(item.id)} (#${item.id}, ${formatBytes(item.sizeBytes)})`;
+      acknowledgement = `✅ File disimpan: ${item.path} (#${item.id}, ${formatBytes(item.sizeBytes)})`;
     } catch (error) {
       const message =
         error instanceof DuplicateVaultItemError
@@ -1027,7 +1025,7 @@ export function createTelegramBot(
       const base = extension ? fileName.slice(0, -extension.length) : fileName;
       fileName = `${base} (Telegram ${ctx.message!.message_id})${extension}`;
     }
-    const item = await dependencies.vault.saveFileObject(
+    const item = await dependencies.vault.saveFile(
       {
         name: fileName,
         mimeType: validated.detectedMimeType,
@@ -1041,12 +1039,12 @@ export function createTelegramBot(
       },
       signal,
     );
-    const vaultPath = dependencies.vault.pathFor(item.id);
+    const vaultPath = item.path;
     try {
       await awaitTelegramCall(
         (telegramSignal) =>
           ctx.reply(
-            `✅ File tersimpan: ${vaultPath} (#${item.id}, ${formatBytes(item.sizeBytes)}, ${item.storageBackend === "s3" ? "Bucket" : "Volume"}). Analisis dilanjutkan…`,
+            `✅ File tersimpan: ${vaultPath} (#${item.id}, ${formatBytes(item.sizeBytes)}). Analisis dilanjutkan…`,
             {},
             asGrammySignal(telegramSignal),
           ),
@@ -1084,11 +1082,11 @@ export function createTelegramBot(
           mimeType: item.detectedMimeType ?? item.mimeType,
           sizeBytes: item.sizeBytes,
         },
-        vault: { saved: true, id: item.id, path: vaultPath, backend: item.storageBackend },
+        vault: { saved: true, id: item.id, path: vaultPath },
         ...(analysis.summary ? { extractedAnalysis: analysis.summary } : {}),
         ...(analysis.warning ? { analysisWarning: analysis.warning } : {}),
       },
-      footer: `✅ File tersimpan: ${vaultPath} (#${item.id}, ${formatBytes(item.sizeBytes)}, ${item.storageBackend === "s3" ? "Bucket" : "Volume"})`,
+      footer: `✅ File tersimpan: ${vaultPath} (#${item.id}, ${formatBytes(item.sizeBytes)})`,
     };
   }
 
@@ -1525,7 +1523,7 @@ export function createTelegramBot(
       return;
     }
     try {
-      const deleted = await dependencies.vault.deleteStored(Number(match[1]));
+      const deleted = await dependencies.vault.delete(Number(match[1]));
       await ctx.reply(`🗑️ Item dihapus (${deleted} item termasuk isi folder).`);
     } catch (error) {
       await ctx.reply(`⚠️ ${error instanceof Error ? error.message : "Item gagal dihapus."}`);

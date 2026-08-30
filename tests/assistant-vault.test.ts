@@ -5,7 +5,7 @@ import { createLogger } from "../src/logger.js";
 import { ConversationService } from "../src/services/conversation.js";
 import { EmailRuleService } from "../src/services/email-rules.js";
 import { MemoryService } from "../src/services/memory.js";
-import { VaultService } from "../src/services/vault.js";
+import { openVault } from "../src/services/vault.js";
 import { temporaryDatabase, testConfig } from "./helpers.js";
 
 function fakeStream(chunks: unknown[]): AsyncIterable<unknown> {
@@ -21,8 +21,8 @@ describe("assistant vault tools", () => {
     const setup = temporaryDatabase();
     try {
       const config = testConfig();
-      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
-      const file = vault.saveFile({ name: "invoice-agustus.pdf", bytes: Buffer.from("pdf") });
+      const vault = await openVault(setup.database, `${setup.directory}/vault`);
+      const file = await vault.saveFile({ name: "invoice-agustus.pdf", bytes: Buffer.from("pdf") });
       const create = vi
         .fn()
         .mockResolvedValueOnce(
@@ -107,7 +107,7 @@ describe("assistant vault tools", () => {
     const setup = temporaryDatabase();
     try {
       const config = testConfig();
-      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const vault = await openVault(setup.database, `${setup.directory}/vault`);
       const note = vault.saveNote(
         "Railway Dashboard - admin",
         "username: owner@example.test\npassword: dummy-password",
@@ -275,7 +275,7 @@ describe("assistant vault tools", () => {
     const setup = temporaryDatabase();
     try {
       const config = testConfig();
-      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const vault = await openVault(setup.database, `${setup.directory}/vault`);
       const note = vault.saveNote("Login internal", "password: dummy-password");
       const search = vi.fn(async () => []);
       const create = vi
@@ -357,7 +357,7 @@ describe("assistant vault tools", () => {
     const setup = temporaryDatabase();
     try {
       const config = testConfig();
-      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const vault = await openVault(setup.database, `${setup.directory}/vault`);
       const note = vault.saveNote("Railway Dashboard - admin", "username: admin");
       const create = vi
         .fn()
@@ -496,7 +496,7 @@ describe("assistant vault tools", () => {
     const setup = temporaryDatabase();
     try {
       const config = testConfig();
-      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const vault = await openVault(setup.database, `${setup.directory}/vault`);
       const create = vi
         .fn()
         .mockResolvedValueOnce(
@@ -605,7 +605,7 @@ describe("assistant vault tools", () => {
         {
           conversations: new ConversationService(setup.database),
           memories,
-          vault: new VaultService(setup.database, `${setup.directory}/vault`),
+          vault: await openVault(setup.database, `${setup.directory}/vault`),
           emailRules: new EmailRuleService(setup.database),
           gmail: null,
           search: { name: "test", available: false, async search() { return []; } },
@@ -643,7 +643,7 @@ describe("assistant vault tools", () => {
     const setup = temporaryDatabase();
     try {
       const config = testConfig();
-      const vault = new VaultService(setup.database, `${setup.directory}/vault`);
+      const vault = await openVault(setup.database, `${setup.directory}/vault`);
       const csv = "tanggal,kategori,jumlah\n2026-08-25,Servis,1200000";
       const create = vi
         .fn()
@@ -700,7 +700,7 @@ describe("assistant vault tools", () => {
       expect(item.kind).toBe("file");
       expect(item.name).toBe("Pengeluaran-2026-08.csv");
       expect(item.mimeType).toContain("text/csv");
-      expect(Buffer.from(await vault.fileBytes(item.id))).toEqual(Buffer.from(csv));
+      expect(Buffer.from((await vault.readFile(item.id)).bytes)).toEqual(Buffer.from(csv));
       expect(events).toContainEqual({ type: "file", itemId: item.id });
     } finally {
       setup.cleanup();

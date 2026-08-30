@@ -9,7 +9,7 @@ import { createLogger } from "../src/logger.js";
 import { ConversationService } from "../src/services/conversation.js";
 import { EmailRuleService } from "../src/services/email-rules.js";
 import { MemoryService } from "../src/services/memory.js";
-import { VaultService } from "../src/services/vault.js";
+import { openVault } from "../src/services/vault.js";
 import { temporaryDatabase, testConfig } from "./helpers.js";
 
 function fakeStream(chunks: unknown[]): AsyncIterable<unknown> {
@@ -55,7 +55,7 @@ describe("assistant vision input", () => {
         {
           conversations,
           memories: new MemoryService(database),
-          vault: new VaultService(database, `${directory}/vault`),
+          vault: await openVault(database, `${directory}/vault`),
           emailRules: new EmailRuleService(database),
           gmail: null,
           search: {
@@ -113,7 +113,7 @@ describe("assistant vision input", () => {
         {
           conversations,
           memories: new MemoryService(database),
-          vault: new VaultService(database, `${directory}/vault`),
+          vault: await openVault(database, `${directory}/vault`),
           emailRules: new EmailRuleService(database),
           gmail: null,
           search: {

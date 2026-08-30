@@ -19,7 +19,6 @@ export interface MemoryItem {
 }
 
 export type VaultItemKind = "folder" | "file" | "note";
-export type VaultStorageBackend = "local" | "s3";
 
 export interface VaultItem {
   id: number;
@@ -28,14 +27,11 @@ export interface VaultItem {
   name: string;
   mimeType: string | null;
   sizeBytes: number;
-  storageKey: string | null;
-  storageBackend: VaultStorageBackend;
   detectedMimeType: string | null;
   mediaKind: string | null;
   sourceFileUniqueId: string | null;
   sourceCaption: string | null;
   content: string | null;
-  sha256: string | null;
   sourceChatId: string | null;
   sourceMessageId: string | null;
   createdAt: string;

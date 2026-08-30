@@ -39,7 +39,7 @@ SQLite menyimpan riwayat pendek dan memori jangka panjang secara terpisah. Retri
 
 ### Vault
 
-`VaultService` memakai SQLite untuk struktur folder, nama, tipe, hash, caption/sumber Telegram, backend, dan isi catatan. Byte file memakai storage key UUID, sehingga nama pengguna tidak pernah menjadi path fisik. Backend `local` mempertahankan staging/trash dan journal pada Volume; backend `s3` menyimpan file baru ke private Railway Bucket. Metadata per item membuat file legacy lokal tetap dapat dibaca setelah default diubah ke S3.
+Modul `Vault` memakai SQLite untuk struktur folder, nama, tipe, hash, caption/sumber Telegram, backend, dan isi catatan. Telegram, Dashboard, Assistant, dan test bergantung pada interface `Vault`; implementasi konkret serta adapter penyimpanan tetap internal. Byte file memakai storage key UUID, sehingga nama pengguna tidak pernah menjadi path fisik. Backend `local` memakai staging untuk write dan journal untuk cleanup delete setelah metadata commit; recovery tetap memahami operasi trash lama. Backend `s3` menyimpan file baru ke private Railway Bucket. Metadata per item membuat file legacy lokal tetap dapat dibaca setelah default diubah ke S3.
 
 Upload tidak mempercayai filename atau MIME Telegram. Executable/script dan archive generik ditolak; signature, ukuran aktual, serta SHA-256 disimpan/divalidasi. Dashboard memaksa download dengan `Content-Disposition: attachment` dan `nosniff`.
 
@@ -95,7 +95,7 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 | `messages` | Riwayat percakapan pendek per Telegram chat |
 | `memories` | Preferensi/fakta/komitmen personal |
 | `vault_items` | Struktur folder, catatan, dan metadata file vault |
-| `vault_fs_operations` | Journal staging/trash untuk recovery operasi file vault |
+| `vault_fs_operations` | Journal staging/cleanup filesystem untuk recovery operasi file vault |
 | `vault_object_operations` | Journal retry upload/delete object S3 lintas crash |
 | `email_rules` | Deskripsi semantik dan Gmail query opsional |
 | `email_evaluations` | Deduplikasi dan audit hasil rule-message |

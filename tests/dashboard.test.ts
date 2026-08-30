@@ -4,7 +4,7 @@ import { startDashboard, stopDashboard } from "../src/dashboard/server.js";
 import { recordUsage } from "../src/db.js";
 import { createLogger } from "../src/logger.js";
 import { RequestTraceService } from "../src/services/request-trace.js";
-import { VaultService } from "../src/services/vault.js";
+import { openVault } from "../src/services/vault.js";
 import { temporaryDatabase, testConfig } from "./helpers.js";
 
 describe("vault dashboard", () => {
@@ -21,7 +21,7 @@ describe("vault dashboard", () => {
     };
     server = await startDashboard(config, {
       database: setup.database,
-      vault: new VaultService(setup.database, `${setup.directory}/vault`),
+      vault: await openVault(setup.database, `${setup.directory}/vault`),
       logger: createLogger(config),
     });
     const port = (server!.address() as AddressInfo).port;

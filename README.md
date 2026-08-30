@@ -550,7 +550,7 @@ sudo journalctl -u personal-ai-assistant -f
 
 ### Data persisten dan backup
 
-SQLite, memori, aturan email, cursor/checkpoint Gmail, trace, journal recovery vault, dan file Vault lokal tersimpan pada `./data`. Bila `VAULT_STORAGE_BACKEND=s3`, file baru berada di Bucket sementara metadata dan file legacy tetap berada di Volume. Operasi lokal memakai staging/trash dan operasi S3 memakai journal yang direkonsiliasi saat startup. Untuk backup yang konsisten:
+SQLite, memori, aturan email, cursor/checkpoint Gmail, trace, journal recovery vault, dan file Vault lokal tersimpan pada `./data`. Bila `VAULT_STORAGE_BACKEND=s3`, file baru berada di Bucket sementara metadata dan file legacy tetap berada di Volume. Operasi lokal memakai staging write dan journal cleanup delete; recovery tetap mendukung operasi trash lama. Operasi S3 memakai journal yang direkonsiliasi saat startup. Untuk backup yang konsisten:
 
 1. Hentikan proses/container assistant.
 2. Salin seluruh folder `data` ke lokasi backup yang terenkripsi atau aksesnya terbatas.

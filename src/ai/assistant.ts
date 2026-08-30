@@ -9,7 +9,7 @@ import type { ConversationService } from "../services/conversation.js";
 import type { EmailRuleService } from "../services/email-rules.js";
 import type { GmailService } from "../services/gmail.js";
 import type { MemoryService } from "../services/memory.js";
-import type { VaultService } from "../services/vault.js";
+import type { Vault } from "../services/vault.js";
 import { formatSearchResults, type WebSearchProvider } from "../services/web-search.js";
 import type { StoredMessage } from "../types.js";
 import { buildSystemPrompt, buildUntrustedPersonalContext } from "./prompts.js";
@@ -520,7 +520,7 @@ export function limitConversationHistory(
 interface AssistantDependencies {
   conversations: ConversationService;
   memories: MemoryService;
-  vault: VaultService;
+  vault: Vault;
   emailRules: EmailRuleService;
   gmail: GmailService | null;
   search: WebSearchProvider;
@@ -893,7 +893,7 @@ export class PersonalAssistant {
           const suffix = `.${args.format}`;
           const name = args.name.toLowerCase().endsWith(suffix) ? args.name : `${args.name}${suffix}`;
           const parent = args.folder ? this.dependencies.vault.ensureFolderPath(args.folder) : null;
-          const item = await this.dependencies.vault.saveFileObject(
+          const item = await this.dependencies.vault.saveFile(
             {
               name,
               mimeType: mimeTypes[args.format],
@@ -907,7 +907,7 @@ export class PersonalAssistant {
           this.emit(options, { type: "file", itemId: item.id });
           return JSON.stringify({
             saved: true,
-            item: { id: item.id, name: item.name, path: this.dependencies.vault.pathFor(item.id) },
+            item: { id: item.id, name: item.name, path: item.path },
             queuedForTelegram: true,
           });
         }

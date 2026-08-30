@@ -6,7 +6,7 @@ import { safeErrorMessage, type AppLogger } from "../logger.js";
 import {
   DuplicateVaultItemError,
   InvalidVaultOperationError,
-  type VaultService,
+  type Vault,
 } from "../services/vault.js";
 import { validateAttachment } from "../services/attachments.js";
 import { observabilitySnapshot, parseObservabilityPeriod } from "./observability.js";
@@ -14,7 +14,7 @@ import { dashboardPage } from "./page.js";
 
 interface DashboardDependencies {
   database: Database.Database;
-  vault: VaultService;
+  vault: Vault;
   logger: AppLogger;
 }
 
@@ -74,7 +74,10 @@ function nullableId(value: unknown): number | null {
   return id;
 }
 
-function publicItem(vault: VaultService, item: NonNullable<ReturnType<VaultService["get"]>>) {
+function publicItem(
+  vault: Vault,
+  item: NonNullable<ReturnType<Vault["get"]>> & { path?: string },
+) {
   return {
     id: item.id,
     parentId: item.parentId,
@@ -83,13 +86,13 @@ function publicItem(vault: VaultService, item: NonNullable<ReturnType<VaultServi
     mimeType: item.mimeType,
     sizeBytes: item.sizeBytes,
     content: item.content,
-    path: vault.pathFor(item.id),
+    path: item.path ?? vault.pathFor(item.id),
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
   };
 }
 
-function statusSnapshot(database: Database.Database, vault: VaultService) {
+function statusSnapshot(database: Database.Database, vault: Vault) {
   const counts = database
     .prepare(
       `SELECT
@@ -186,7 +189,7 @@ async function handleApi(
       },
       bytes,
     );
-    const item = await vault.saveFileObject({
+    const item = await vault.saveFile({
       name: fileName,
       mimeType: validated.detectedMimeType,
       detectedMimeType: validated.detectedMimeType,
@@ -205,14 +208,14 @@ async function handleApi(
   if (!item) throw new InvalidVaultOperationError(`Item vault ${id} tidak ditemukan.`);
   if (request.method === "GET" && itemMatch[2] === "/download") {
     if (item.kind !== "file") throw new InvalidVaultOperationError("Item bukan file.");
-    const bytes = await vault.fileBytes(id);
+    const file = await vault.readFile(id);
     response.writeHead(200, {
-      "content-type": item.mimeType ?? "application/octet-stream",
-      "content-length": item.sizeBytes,
-      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(item.name)}`,
+      "content-type": file.mimeType ?? "application/octet-stream",
+      "content-length": file.sizeBytes,
+      "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`,
       "x-content-type-options": "nosniff",
     });
-    response.end(bytes);
+    response.end(file.bytes);
     return true;
   }
   if (request.method === "PATCH" && !itemMatch[2]) {
@@ -233,7 +236,7 @@ async function handleApi(
     return true;
   }
   if (request.method === "DELETE" && !itemMatch[2]) {
-    sendJson(response, 200, { deleted: await vault.deleteStored(id) });
+    sendJson(response, 200, { deleted: await vault.delete(id) });
     return true;
   }
   return false;

@@ -14,7 +14,7 @@ import { MemoryService } from "./services/memory.js";
 import { createVaultObjectStorage } from "./services/object-storage.js";
 import { RequestTraceService } from "./services/request-trace.js";
 import { TelegramHistoryService } from "./services/telegram-history.js";
-import { VaultService } from "./services/vault.js";
+import { openVault } from "./services/vault.js";
 import { createSearchProvider } from "./services/web-search.js";
 import { createTelegramBot, splitTelegramMessage } from "./telegram/bot.js";
 
@@ -34,13 +34,12 @@ async function main(): Promise<void> {
     logger.info({ prunedTelegramMessages }, "Expired Telegram message references deleted");
   }
   const memories = new MemoryService(database);
-  const vault = new VaultService(
+  const vault = await openVault(
     database,
     config.VAULT_STORAGE_PATH,
     createVaultObjectStorage(config),
     config.VAULT_STORAGE_BACKEND,
   );
-  await vault.reconcileObjectStorageOperations();
   const traces = new RequestTraceService(database, config.TRACE_ENABLED_DEFAULT);
   traces.pruneOlderThan(config.MESSAGE_RETENTION_DAYS);
   pruneUsageOlderThan(database, config.MESSAGE_RETENTION_DAYS);

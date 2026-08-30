@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { parseMcpConnections } from "./mcp/config.js";
 
 const optionalTrimmedString = z.preprocess(
   (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
@@ -78,21 +79,32 @@ const envSchema = z.object({
   BRAVE_SEARCH_API_KEY: optionalTrimmedString,
   SEARXNG_BASE_URL: z.string().url().default("http://localhost:8080"),
   SEARCH_RESULT_LIMIT: z.coerce.number().int().min(1).max(10).default(5),
+  MCP_CONNECTIONS_JSON: z.string().trim().default("[]"),
 }).superRefine((config, context) => {
-  if (config.VAULT_STORAGE_BACKEND !== "s3") return;
-  for (const key of [
-    "S3_BUCKET",
-    "S3_ENDPOINT",
-    "S3_ACCESS_KEY_ID",
-    "S3_SECRET_ACCESS_KEY",
-  ] as const) {
-    if (!config[key]) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: [key],
-        message: `${key} wajib diisi ketika VAULT_STORAGE_BACKEND=s3`,
-      });
+  if (config.VAULT_STORAGE_BACKEND === "s3") {
+    for (const key of [
+      "S3_BUCKET",
+      "S3_ENDPOINT",
+      "S3_ACCESS_KEY_ID",
+      "S3_SECRET_ACCESS_KEY",
+    ] as const) {
+      if (!config[key]) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `${key} wajib diisi ketika VAULT_STORAGE_BACKEND=s3`,
+        });
+      }
     }
+  }
+  try {
+    parseMcpConnections(config.MCP_CONNECTIONS_JSON);
+  } catch (error) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["MCP_CONNECTIONS_JSON"],
+      message: error instanceof Error ? error.message : "Konfigurasi MCP tidak valid.",
+    });
   }
 });
 

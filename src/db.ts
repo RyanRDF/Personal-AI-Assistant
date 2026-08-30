@@ -161,6 +161,88 @@ CREATE INDEX IF NOT EXISTS idx_request_traces_chat_started
   ON request_traces(chat_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_request_traces_started
   ON request_traces(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+  id TEXT PRIMARY KEY,
+  owner_chat_id TEXT NOT NULL,
+  input_kind TEXT NOT NULL CHECK (input_kind IN ('text', 'image')),
+  model TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ('queued', 'running', 'waiting_approval', 'completed', 'failed', 'cancelled', 'outcome_unknown')
+  ),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_chat_created
+  ON agent_runs(owner_chat_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_status_updated
+  ON agent_runs(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS agent_run_events (
+  run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  sequence INTEGER NOT NULL CHECK (sequence > 0),
+  type TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS agent_approvals (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  invocation_id TEXT NOT NULL,
+  invocation_digest TEXT NOT NULL,
+  preview_json TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+  expires_at TEXT NOT NULL,
+  decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_approvals_run_status
+  ON agent_approvals(run_id, status);
+
+CREATE TABLE IF NOT EXISTS tool_invocations (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  capability_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK (
+    status IN ('prepared', 'started', 'succeeded', 'failed', 'outcome_unknown')
+  ),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  started_at TEXT,
+  completed_at TEXT,
+  receipt_json TEXT,
+  error_code TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mcp_connections (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  server_url TEXT NOT NULL,
+  auth_ref TEXT,
+  status TEXT NOT NULL CHECK (status IN ('disabled', 'validating', 'ready', 'degraded')),
+  allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mcp_capabilities (
+  connection_id TEXT NOT NULL REFERENCES mcp_connections(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  model_name TEXT NOT NULL UNIQUE,
+  schema_hash TEXT NOT NULL,
+  risk_class TEXT NOT NULL CHECK (
+    risk_class IN ('read', 'write-reversible', 'write-sensitive', 'forbidden')
+  ),
+  approval TEXT NOT NULL CHECK (approval IN ('never', 'always')),
+  enabled INTEGER NOT NULL DEFAULT 0,
+  discovered_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY (connection_id, name)
+);
 `;
 
 export function openDatabase(databasePath: string, logger?: AppLogger): Database.Database {

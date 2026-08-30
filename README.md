@@ -17,6 +17,7 @@ Asisten AI personal berbasis Telegram untuk satu pemilik. Aplikasi dapat mengobr
 - Gmail read-only dengan OAuth 2.0.
 - Aturan email natural-language, klasifikasi semantik, Gmail History cursor, persistent outbox, dan deduplikasi notifikasi.
 - Brave Search API atau SearXNG sebagai pencarian web.
+- Agent runtime durable dengan audit event, policy capability terpusat, dan koneksi MCP HTTP opsional.
 - Structured logging dengan redaksi credential dan pencatatan penggunaan token.
 - Docker, unit tests, typecheck, dan build produksi.
 
@@ -26,13 +27,12 @@ Asisten AI personal berbasis Telegram untuk satu pemilik. Aplikasi dapat mengobr
 Telegram (owner only)
         │
         ▼
-PersonalAssistant ── OpenAI tool calling
+AgentRuntime ── OpenAI tool calling compatibility layer
         │
-        ├── SQLite memory + conversation
-        ├── SQLite vault metadata + local Volume atau Railway Bucket
-        ├── Gmail search
-        ├── Email watch rules
-        └── Brave Search / SearXNG
+        ├── RunStore + append-only run events (SQLite)
+        └── Capability Registry ── Policy ── Executor
+                                  ├── Local: memory, vault, Gmail, web search
+                                  └── Remote: allowlisted MCP read tools
 
 Gmail History poller ── semantic classifier ── Telegram notification
 
@@ -209,6 +209,7 @@ Salin `.env.example` menjadi `.env`, lalu ubah hanya nilai yang diperlukan. Nila
 | `MAX_HISTORY_CHARS` | Tidak | Batas karakter recent context untuk mencegah payload model terlalu besar; default `60000` |
 | `MAX_MEMORY_ITEMS` | Tidak | Maksimum memory context; default `20` |
 | `MESSAGE_RETENTION_DAYS` | Tidak | Retensi chat dan trace; default `90` hari |
+| `MCP_CONNECTIONS_JSON` | Tidak | Daftar koneksi MCP remote dan allowlist capability; default `[]` |
 
 ### Gmail
 
@@ -234,6 +235,34 @@ Salin `.env.example` menjadi `.env`, lalu ubah hanya nilai yang diperlukan. Nila
 | `SEARXNG_SECRET` | Untuk SearXNG | Generate dengan `npm run searxng:secret` |
 | `BRAVE_SEARCH_API_KEY` | Untuk Brave | API key dari Brave Search API dashboard |
 | `SEARCH_RESULT_LIMIT` | Tidak | Jumlah hasil; default `5`, maksimum `10` |
+
+## Menghubungkan MCP
+
+MCP bersifat opsional dan tidak ada server yang aktif secara default. Runtime saat ini mendukung
+server MCP remote berbasis HTTP melalui SDK resmi, melakukan discovery hanya pada tool yang masuk
+allowlist, dan memperlakukan hasil server sebagai data eksternal tidak tepercaya.
+
+Contoh konfigurasi satu baris di `.env`:
+
+```dotenv
+MCP_CONNECTIONS_JSON=[{"id":"drive","label":"Drive resmi","serverUrl":"https://mcp.example.com/mcp","authorizationEnv":"DRIVE_MCP_TOKEN","allowedTools":[{"name":"search","riskClass":"read","approval":"never"}]}]
+DRIVE_MCP_TOKEN=token-rahasia
+```
+
+Aturan keamanan konfigurasi:
+
+- `serverUrl` remote wajib HTTPS; HTTP hanya diterima untuk loopback lokal.
+- Token tidak boleh ditaruh dalam JSON atau database. `authorizationEnv` hanya berisi nama variable
+  environment yang menyimpan token.
+- Hanya tool yang disebut di `allowedTools` yang terlihat oleh model.
+- Implementasi tahap ini hanya mengeksekusi tool `read` dengan `approval: "never"`. Nilai default
+  `approval: "always"` akan gagal tertutup sampai alur approval persisten tersedia.
+- Gunakan server resmi atau yang Anda kendalikan. URL MCP dari chat pengguna tidak pernah dijadikan
+  koneksi secara otomatis.
+
+Restart bot setelah mengubah konfigurasi. Koneksi yang gagal discovery tidak memutus tool lokal;
+statusnya dicatat sebagai degraded untuk diagnosis. Dukungan approval interaktif, resume setelah
+approval, dan aksi tulis MCP berada pada fase implementasi berikutnya.
 
 ## Menghubungkan Gmail
 

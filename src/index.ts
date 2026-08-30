@@ -2,9 +2,14 @@ import OpenAI from "openai";
 import { run } from "@grammyjs/runner";
 import { EmailClassifier } from "./ai/email-classifier.js";
 import { PersonalAssistant } from "./ai/assistant.js";
+import { DurableAgentRuntime } from "./agent/runtime.js";
+import { AgentRunStore } from "./agent/run-store.js";
 import { isGmailConfigured, loadConfig } from "./config.js";
 import { openDatabase, pruneUsageOlderThan } from "./db.js";
 import { createLogger } from "./logger.js";
+import { parseMcpConnections } from "./mcp/config.js";
+import { McpHttpCapabilityAdapter } from "./mcp/http-adapter.js";
+import { McpCatalogStore } from "./mcp/store.js";
 import { startDashboard, stopDashboard } from "./dashboard/server.js";
 import { ConversationService } from "./services/conversation.js";
 import { EmailRuleService } from "./services/email-rules.js";
@@ -22,6 +27,11 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config);
   const database = openDatabase(config.DATABASE_PATH, logger);
+  const runStore = new AgentRunStore(database);
+  const recoveredRuns = runStore.recoverInterrupted();
+  if (recoveredRuns.length > 0) {
+    logger.warn({ recoveredRuns: recoveredRuns.length }, "Interrupted Agent Runs marked failed");
+  }
   const conversations = new ConversationService(database);
   const prunedMessages = conversations.pruneOlderThan(config.MESSAGE_RETENTION_DAYS);
   if (prunedMessages > 0) {
@@ -47,6 +57,13 @@ async function main(): Promise<void> {
   const search = createSearchProvider(config);
   const gmailConfigured = isGmailConfigured(config);
   const gmail = gmailConfigured ? new GmailService(config) : null;
+  const mcpConnections = parseMcpConnections(config.MCP_CONNECTIONS_JSON);
+  const mcpCatalog = new McpCatalogStore(database);
+  mcpCatalog.syncConnections(mcpConnections);
+  const mcpAdapters = mcpConnections.map(
+    (connection) =>
+      new McpHttpCapabilityAdapter(connection, logger, process.env, undefined, mcpCatalog),
+  );
 
   const assistant = new PersonalAssistant(config, database, logger, {
     conversations,
@@ -55,9 +72,15 @@ async function main(): Promise<void> {
     emailRules,
     gmail,
     search,
+    capabilityAdapters: mcpAdapters,
   });
-  const bot = createTelegramBot(config, logger, {
+  const agentRuntime = new DurableAgentRuntime(
     assistant,
+    runStore,
+    config.OPENAI_CHAT_MODEL,
+  );
+  const bot = createTelegramBot(config, logger, {
+    assistant: agentRuntime,
     conversations,
     memories,
     vault,
@@ -127,6 +150,7 @@ async function main(): Promise<void> {
     await watcher?.stopAndWait();
     await runner.stop();
     await stopDashboard(dashboard);
+    await Promise.allSettled(mcpAdapters.map(async (adapter) => await adapter.close()));
     database.close();
   };
   process.once("SIGINT", () => void shutdown("SIGINT"));

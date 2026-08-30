@@ -3,8 +3,8 @@ import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import type {
   AssistantEvent,
   AssistantImageInput,
-  PersonalAssistant,
 } from "../ai/assistant.js";
+import type { AgentRuntime } from "../agent/runtime.js";
 import type { AppConfig } from "../config.js";
 import { safeErrorMessage, type AppLogger } from "../logger.js";
 import type { ConversationService } from "../services/conversation.js";
@@ -83,7 +83,7 @@ interface PhotoCandidate {
 }
 
 interface BotDependencies {
-  assistant: PersonalAssistant;
+  assistant: AgentRuntime;
   conversations: ConversationService;
   memories: MemoryService;
   vault: Vault;
@@ -946,6 +946,8 @@ export function createTelegramBot(
         {
           signal: active.controller.signal,
           onEvent,
+          runId: trace.requestId,
+          inputKind,
           ...(behavior.isolated ? { isolated: true } : {}),
         },
       );
@@ -1659,7 +1661,10 @@ export function createTelegramBot(
       chatId,
       new Error("Cancelled by Telegram owner"),
     );
-    if (active) active.controller.abort(new Error("Cancelled by Telegram owner"));
+    if (active) {
+      dependencies.assistant.cancel(active.requestId);
+      active.controller.abort(new Error("Cancelled by Telegram owner"));
+    }
     if (active || hadPendingImage) {
       await ctx.reply(
         active

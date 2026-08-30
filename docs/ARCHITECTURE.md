@@ -14,9 +14,23 @@
 
 `src/telegram/bot.ts` menerima teks, foto, dokumen, video, animation, audio, voice, video note, dan sticker melalui long polling concurrent. Middleware pertama memverifikasi numeric owner ID dan private chat. Attachment dan caption dinormalisasi sebagai satu request, diunduh dengan byte counter, divalidasi berdasarkan signature, disimpan ke Vault, lalu dianalisis sesuai tipe. Progress edit dibatasi lajunya, request memiliki timeout, dan `/cancel` tetap responsif ketika model bekerja.
 
-### AI orchestrator
+### Agent runtime dan capability platform
 
-`src/ai/assistant.ts` menyediakan tool terstruktur:
+`src/agent/runtime.ts` menjadi pintu masuk request AI dari Telegram. Runtime membuat `Agent Run`
+persisten, mencatat event lifecycle secara append-only, meneruskan cancel signal, dan menutup run
+sebagai `completed`, `failed`, atau `cancelled`. Pada startup, run `queued`/`running` yang terputus
+ditandai gagal dengan kode aman; prompt mentah dan pesan error tidak disalin ke audit event.
+
+`src/ai/assistant.ts` tetap menjadi compatibility model adapter berbasis Chat Completions selama
+migrasi bertahap. Tool lokal dan MCP dinormalisasi menjadi `Capability`, lalu melewati tiga seam:
+
+- `CapabilityRegistry` menggabungkan catalog adapter tanpa membuat satu koneksi rusak memutus catalog
+  lokal;
+- `PolicyEngine` menentukan capability yang boleh terlihat dan mengotorisasi ulang argumen tepat
+  sebelum eksekusi;
+- `CapabilityExecutor` hanya menjalankan invocation yang sudah memperoleh keputusan authorize.
+
+Capability lokal yang tersedia meliputi:
 
 - `remember`
 - `update_memory`
@@ -31,7 +45,26 @@
 - `list_vault`
 - `return_vault_file`
 
-Model melakukan maksimum enam putaran tool untuk mencegah loop tanpa batas. Chat completion diproses secara streaming agar preview jawaban dapat ditampilkan. Tool mutasi hanya dimasukkan ke request model bila klausa awal pesan pemilik memberi intent eksplisit; penghapusan memori/aturan tetap command Telegram deterministik. Semua penggunaan token ditulis ke `usage_events`; tahap, tool, durasi, dan status request ditulis ke `request_traces` tanpa menyimpan gambar atau chain-of-thought.
+Model melakukan maksimum enam putaran tool untuk mencegah loop tanpa batas. Chat completion diproses
+secara streaming agar preview jawaban dapat ditampilkan. Tool mutasi hanya dimasukkan ke request model
+bila klausa awal pesan pemilik memberi intent eksplisit; penghapusan memori/aturan tetap command
+Telegram deterministik. Semua penggunaan token ditulis ke `usage_events`; tahap, tool, durasi, dan
+status request ditulis ke `request_traces` tanpa menyimpan gambar atau chain-of-thought.
+
+### MCP adapter
+
+`src/mcp/http-adapter.ts` memakai MCP TypeScript SDK resmi dan Streamable HTTP transport dengan
+negosiasi versi otomatis. Koneksi berasal dari `MCP_CONNECTIONS_JSON`, bukan dari isi chat. Konfigurasi
+menolak credential di URL, mewajibkan HTTPS untuk host remote, mereferensikan token melalui nama
+environment variable, dan hanya mengekspos tool yang masuk allowlist.
+
+Catalog discovery, schema hash, expiry, dan health connection disimpan di SQLite. Schema yang tidak
+valid dilewati tanpa memutus capability lokal. Output MCP dipotong sesuai batas connection, media/body
+resource tidak diteruskan, dan seluruh hasil diberi label `untrusted-external-result`.
+
+Milestone saat ini hanya mengizinkan MCP `read` dengan `approval: never`. Konfigurasi lain gagal
+tertutup. Tabel approval sudah disiapkan, tetapi approval interaktif dan resume run belum diaktifkan;
+aksi tulis eksternal tidak dapat dieksekusi melalui adapter ini.
 
 ### Memori
 
@@ -104,12 +137,18 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 | `app_state` | Gmail History cursor dan state kecil lain |
 | `usage_events` | Penggunaan token per purpose/model |
 | `request_traces` | Tahap operasional, tool, durasi, status, dan token per request |
+| `agent_runs` | Lifecycle durable satu request AI tanpa menyimpan prompt mentah |
+| `agent_run_events` | Audit event append-only dan berurutan untuk setiap run |
+| `agent_approvals` | Penyimpanan approval terikat digest untuk fase approval interaktif |
+| `tool_invocations` | Status invocation dan idempotency untuk fase side effect durable |
+| `mcp_connections` | Metadata, secret reference, dan health koneksi MCP |
+| `mcp_capabilities` | Catalog capability MCP, schema hash, policy, dan masa cache |
 
 ## Trust boundaries
 
 - Telegram identity adalah authorization boundary utama.
 - `.env` adalah secret boundary dan tidak masuk Git.
-- Email, web, memory, data vault, OCR, dokumen, transkrip, dan frame video merupakan input tidak tepercaya.
+- Email, web, MCP, memory, data vault, OCR, dokumen, transkrip, dan frame video merupakan input tidak tepercaya.
 - Byte attachment disimpan sebagai object private dan tidak ditulis ke database atau log; SQLite hanya menyimpan metadata, caption, dan checksum.
 - Subject, snippet, dan body email yang dipotong dikirim ke OpenAI untuk klasifikasi/pencarian; tidak ditulis ke log.
 - OpenAI tidak diberi tool shell, email send, atau delete; mutasi vault hanya tersedia untuk intent eksplisit.
@@ -120,6 +159,10 @@ Outbox memberi delivery *at-least-once*. Crash setelah Telegram menerima pesan t
 
 Komponen yang dapat ditambahkan tanpa merombak core:
 
+- Approval inbox Telegram yang dapat me-resume run dan memvalidasi digest invocation.
+- Migrasi model orchestration ke Responses API/Agents SDK setelah parity eval tercapai.
+- Worker durable dengan lease, retry, reconciliation, dan status `outcome_unknown`.
+- Aksi MCP tulis reversible setelah approval, idempotency, dan safety eval tersedia.
 - Calendar/reminder scheduler.
 - RAG dokumen pribadi sebagai tool baru.
 - Enkripsi secret dengan AES-256-GCM jika credential dipindahkan dari environment ke database.

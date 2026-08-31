@@ -643,6 +643,110 @@ describe("Telegram safety and formatting", () => {
     );
   });
 
+  it("explains that a truncated Telegram PDF must be downloaded again", async () => {
+    const assistantReply = vi.fn();
+    const saveFile = vi.fn();
+    const editedTexts: string[] = [];
+    const trace = {
+      requestId: "broken-pdf-request",
+      chatId: "123456",
+      model: "test-model",
+      inputKind: "image" as const,
+      startedAt: Date.now(),
+      stages: [],
+      tools: [],
+      inputTokens: 0,
+      outputTokens: 0,
+    };
+    const bot = createTelegramBot(
+      testConfig(),
+      createLogger({ LOG_LEVEL: "silent" }),
+      {
+        assistant: { openaiClient: {}, reply: assistantReply },
+        conversations: {},
+        memories: {},
+        vault: { findDuplicateName: vi.fn(() => null), saveFile },
+        emailRules: {},
+        search: { available: false, name: "none" },
+        traces: {
+          start: vi.fn(() => trace),
+          isLiveEnabled: vi.fn(() => false),
+          addStage: vi.fn(),
+          addTool: vi.fn(),
+          addUsage: vi.fn(),
+          finish: vi.fn(() => trace),
+        },
+        telegramHistory: { record: vi.fn() },
+        gmailConfigured: false,
+      } as never,
+    );
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: "Test",
+      username: "test_bot",
+    } as never;
+    const truncatedPdf = Buffer.from("%PDF-1.4\n1 0 obj\n");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(truncatedPdf, {
+      status: 200,
+      headers: {
+        "content-type": "application/pdf",
+        "content-length": String(truncatedPdf.byteLength),
+      },
+    })));
+    let messageId = 500;
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === "getFile") {
+        return {
+          ok: true,
+          result: {
+            file_id: "broken-pdf",
+            file_unique_id: "broken-pdf-unique",
+            file_size: truncatedPdf.byteLength,
+            file_path: "sertifikat.pdf",
+          },
+        } as never;
+      }
+      if (method === "sendChatAction") return { ok: true, result: true } as never;
+      if (method === "editMessageText") {
+        editedTexts.push(String((payload as { text?: unknown }).text));
+      }
+      messageId += 1;
+      return {
+        ok: true,
+        result: {
+          message_id: messageId,
+          date: 1_700_000_000,
+          chat: { id: 123456, type: "private" },
+          text: "ok",
+        },
+      } as never;
+    });
+
+    await bot.handleUpdate({
+      update_id: 300,
+      message: {
+        message_id: 300,
+        date: 1_700_000_000,
+        chat: { id: 123456, type: "private", first_name: "Owner" },
+        from: { id: 123456, is_bot: false, first_name: "Owner" },
+        document: {
+          file_id: "broken-pdf",
+          file_unique_id: "broken-pdf-unique",
+          file_name: "sertifikat.pdf",
+          mime_type: "application/pdf",
+          file_size: truncatedPdf.byteLength,
+        },
+        caption: "Simpan",
+      },
+    });
+
+    expect(saveFile).not.toHaveBeenCalled();
+    expect(assistantReply).not.toHaveBeenCalled();
+    expect(editedTexts).toContainEqual(expect.stringMatching(/PDF.*rusak.*Unduh ulang/iu));
+    expect(editedTexts.join("\n")).not.toContain("Maaf, terjadi kesalahan");
+  });
+
   it("propagates deadline signals through assistant replies, typing, edits, chunks, and files", async () => {
     const calls: Array<{ method: string; signal: unknown }> = [];
     const trace = {

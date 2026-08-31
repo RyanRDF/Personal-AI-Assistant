@@ -83,6 +83,12 @@ function isProbablyText(bytes: Uint8Array): boolean {
   return replacements <= Math.max(1, decoded.length * 0.01);
 }
 
+function hasCompletePdfTrailer(bytes: Uint8Array): boolean {
+  const tail = Buffer.from(bytes.subarray(Math.max(0, bytes.byteLength - 2_048))).toString("latin1");
+  const eofOffset = tail.lastIndexOf("%%EOF");
+  return eofOffset >= 0 && tail.lastIndexOf("startxref", eofOffset) >= 0;
+}
+
 export async function validateAttachment(
   attachment: IncomingAttachment,
   bytes: Uint8Array,
@@ -107,6 +113,11 @@ export async function validateAttachment(
     throw new InvalidVaultOperationError("Signature file tidak cocok dengan MIME gambar yang diklaim.");
   }
   const detectedMime = detected?.mime ?? (isProbablyText(bytes) ? claimedMime ?? "text/plain" : claimedMime ?? "application/octet-stream");
+  if (detectedMime === "application/pdf" && !hasCompletePdfTrailer(bytes)) {
+    throw new InvalidVaultOperationError(
+      "PDF tampak rusak atau tidak lengkap. Unduh ulang file sumber, pastikan dapat dibuka, lalu kirim kembali.",
+    );
+  }
   const isOfficeContainer = [
     "docx", "pptx", "xlsx", "odt", "odp", "ods",
   ].includes(detectedExtension ?? "");

@@ -23,6 +23,34 @@ describe("secure attachment ingestion", () => {
     expect(result.detectedMimeType).toBe("text/plain");
   });
 
+  it("rejects a Telegram PDF that is truncated before its trailer", async () => {
+    const truncatedPdf = Buffer.from("%PDF-1.4\n1 0 obj\n");
+
+    await expect(
+      validateAttachment(
+        attachment({
+          fileName: "sertifikat.pdf",
+          claimedMimeType: "application/pdf",
+        }),
+        truncatedPdf,
+      ),
+    ).rejects.toThrow(/PDF.*(?:rusak|tidak lengkap)/iu);
+  });
+
+  it("accepts a PDF envelope with startxref and EOF markers", async () => {
+    const completePdf = Buffer.from(
+      "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\nstartxref\n9\n%%EOF\n",
+    );
+
+    const result = await validateAttachment(
+      attachment({ fileName: "sertifikat.pdf", claimedMimeType: "application/pdf" }),
+      completePdf,
+    );
+
+    expect(result.analysisKind).toBe("document");
+    expect(result.detectedMimeType).toBe("application/pdf");
+  });
+
   it("rejects executable names and MIME-spoofed images", async () => {
     await expect(
       validateAttachment(attachment({ fileName: "invoice.exe" }), Buffer.from("MZ executable")),

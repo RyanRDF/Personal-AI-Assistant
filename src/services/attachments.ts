@@ -38,6 +38,7 @@ export interface ValidatedAttachment {
   bytes: Uint8Array;
   detectedMimeType: string;
   analysisKind: AttachmentAnalysisKind;
+  analysisWarning?: string;
 }
 
 export interface AttachmentAnalysis {
@@ -49,7 +50,7 @@ export interface AttachmentAnalysis {
 const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 const DOCUMENT_EXTENSIONS = new Set([
   "pdf", "txt", "md", "json", "html", "htm", "xml", "csv", "tsv", "rtf", "odt",
-  "doc", "docx", "ppt", "pptx", "xls", "xlsx", "iif", "yaml", "yml",
+  "ods", "odp", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "iif", "yaml", "yml",
 ]);
 const DANGEROUS_EXTENSIONS = new Set([
   "exe", "dll", "com", "scr", "msi", "bat", "cmd", "ps1", "vbs", "js", "jar", "apk",
@@ -65,6 +66,32 @@ const DANGEROUS_MIME_TYPES = new Set([
   "application/vnd.android.package-archive",
 ]);
 const ARCHIVE_EXTENSIONS = new Set(["zip", "rar", "7z", "gz", "bz2", "xz", "tar"]);
+const OFFICE_PACKAGE_TYPES = new Map<string, { mimeType: string; markers: string[] }>([
+  ["docx", {
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    markers: ["[Content_Types].xml", "word/"],
+  }],
+  ["xlsx", {
+    mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    markers: ["[Content_Types].xml", "xl/"],
+  }],
+  ["pptx", {
+    mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    markers: ["[Content_Types].xml", "ppt/"],
+  }],
+  ["odt", {
+    mimeType: "application/vnd.oasis.opendocument.text",
+    markers: ["mimetype", "application/vnd.oasis.opendocument.text"],
+  }],
+  ["ods", {
+    mimeType: "application/vnd.oasis.opendocument.spreadsheet",
+    markers: ["mimetype", "application/vnd.oasis.opendocument.spreadsheet"],
+  }],
+  ["odp", {
+    mimeType: "application/vnd.oasis.opendocument.presentation",
+    markers: ["mimetype", "application/vnd.oasis.opendocument.presentation"],
+  }],
+]);
 
 function extensionOf(fileName: string): string {
   return path.extname(fileName).slice(1).toLowerCase();
@@ -87,6 +114,21 @@ function hasCompletePdfTrailer(bytes: Uint8Array): boolean {
   const tail = Buffer.from(bytes.subarray(Math.max(0, bytes.byteLength - 2_048))).toString("latin1");
   const eofOffset = tail.lastIndexOf("%%EOF");
   return eofOffset >= 0 && tail.lastIndexOf("startxref", eofOffset) >= 0;
+}
+
+function officePackageMimeType(
+  fileExtension: string,
+  detectedExtension: string | undefined,
+  bytes: Uint8Array,
+): string | null {
+  const officeType = OFFICE_PACKAGE_TYPES.get(fileExtension);
+  if (!officeType) return null;
+  if (detectedExtension === fileExtension) return officeType.mimeType;
+  if (detectedExtension !== "zip") return null;
+  const packageBytes = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return officeType.markers.every((marker) => packageBytes.includes(marker))
+    ? officeType.mimeType
+    : null;
 }
 
 export async function validateAttachment(
@@ -112,15 +154,9 @@ export async function validateAttachment(
   if (claimedMime?.startsWith("image/") && (!detected || !IMAGE_MIME_TYPES.has(detected.mime))) {
     throw new InvalidVaultOperationError("Signature file tidak cocok dengan MIME gambar yang diklaim.");
   }
-  const detectedMime = detected?.mime ?? (isProbablyText(bytes) ? claimedMime ?? "text/plain" : claimedMime ?? "application/octet-stream");
-  if (detectedMime === "application/pdf" && !hasCompletePdfTrailer(bytes)) {
-    throw new InvalidVaultOperationError(
-      "PDF tampak rusak atau tidak lengkap. Unduh ulang file sumber, pastikan dapat dibuka, lalu kirim kembali.",
-    );
-  }
-  const isOfficeContainer = [
-    "docx", "pptx", "xlsx", "odt", "odp", "ods",
-  ].includes(detectedExtension ?? "");
+  const officeMimeType = officePackageMimeType(extension, detectedExtension, bytes);
+  const detectedMime = officeMimeType ?? detected?.mime ?? (isProbablyText(bytes) ? claimedMime ?? "text/plain" : claimedMime ?? "application/octet-stream");
+  const isOfficeContainer = officeMimeType !== null;
   const isTelegramAnimatedSticker =
     attachment.kind === "sticker" &&
     extension === "tgs" &&
@@ -133,13 +169,25 @@ export async function validateAttachment(
   ) {
     throw new InvalidVaultOperationError("Arsip terkompresi belum diterima karena risiko zip bomb.");
   }
+  const analysisWarning =
+    detectedMime === "application/pdf" && !hasCompletePdfTrailer(bytes)
+      ? "PDF tampak rusak atau tidak lengkap, tetapi tetap tersimpan di Vault; analisis otomatis dilewati. Unduh ulang sumbernya jika isinya perlu dianalisis."
+      : undefined;
   let analysisKind: AttachmentAnalysisKind = "store-only";
-  if (IMAGE_MIME_TYPES.has(detectedMime)) analysisKind = "image";
-  else if (detectedMime.startsWith("video/") || attachment.kind === "video" || attachment.kind === "video_note" || attachment.kind === "animation") analysisKind = "video";
-  else if (detectedMime.startsWith("audio/") || attachment.kind === "audio" || attachment.kind === "voice") analysisKind = "audio";
-  else if (DOCUMENT_EXTENSIONS.has(extension) || DOCUMENT_EXTENSIONS.has(detectedExtension ?? "") || detectedMime === "application/pdf" || detectedMime.startsWith("text/")) analysisKind = "document";
+  if (!analysisWarning) {
+    if (IMAGE_MIME_TYPES.has(detectedMime)) analysisKind = "image";
+    else if (detectedMime.startsWith("video/") || attachment.kind === "video" || attachment.kind === "video_note" || attachment.kind === "animation") analysisKind = "video";
+    else if (detectedMime.startsWith("audio/") || attachment.kind === "audio" || attachment.kind === "voice") analysisKind = "audio";
+    else if (DOCUMENT_EXTENSIONS.has(extension) || DOCUMENT_EXTENSIONS.has(detectedExtension ?? "") || detectedMime === "application/pdf" || detectedMime.startsWith("text/")) analysisKind = "document";
+  }
 
-  return { attachment, bytes, detectedMimeType: detectedMime, analysisKind };
+  return {
+    attachment,
+    bytes,
+    detectedMimeType: detectedMime,
+    analysisKind,
+    ...(analysisWarning ? { analysisWarning } : {}),
+  };
 }
 
 export async function readResponseBytesBounded(
@@ -345,6 +393,7 @@ export async function analyzeAttachment(
   userRequest: string,
   signal: AbortSignal,
 ): Promise<AttachmentAnalysis> {
+  if (input.analysisWarning) return { warning: input.analysisWarning };
   if (!config.ATTACHMENT_ANALYSIS_ENABLED) return { warning: "Analisis attachment dinonaktifkan." };
   if (input.analysisKind === "image") {
     return {

@@ -23,18 +23,19 @@ describe("secure attachment ingestion", () => {
     expect(result.detectedMimeType).toBe("text/plain");
   });
 
-  it("rejects a Telegram PDF that is truncated before its trailer", async () => {
+  it("keeps a truncated Telegram PDF as stored-only data", async () => {
     const truncatedPdf = Buffer.from("%PDF-1.4\n1 0 obj\n");
 
-    await expect(
-      validateAttachment(
-        attachment({
-          fileName: "sertifikat.pdf",
-          claimedMimeType: "application/pdf",
-        }),
-        truncatedPdf,
-      ),
-    ).rejects.toThrow(/PDF.*(?:rusak|tidak lengkap)/iu);
+    const result = await validateAttachment(
+      attachment({
+        fileName: "sertifikat.pdf",
+        claimedMimeType: "application/pdf",
+      }),
+      truncatedPdf,
+    );
+
+    expect(result.analysisKind).toBe("store-only");
+    expect(result.analysisWarning).toMatch(/PDF.*(?:rusak|tidak lengkap).*tersimpan/iu);
   });
 
   it("accepts a PDF envelope with startxref and EOF markers", async () => {
@@ -49,6 +50,45 @@ describe("secure attachment ingestion", () => {
 
     expect(result.analysisKind).toBe("document");
     expect(result.detectedMimeType).toBe("application/pdf");
+  });
+
+  it.each([
+    ["laporan.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "word/document.xml"],
+    ["anggaran.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xl/workbook.xml"],
+    ["presentasi.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "ppt/presentation.xml"],
+    ["catatan.odt", "application/vnd.oasis.opendocument.text", "application/vnd.oasis.opendocument.text"],
+    ["data.ods", "application/vnd.oasis.opendocument.spreadsheet", "application/vnd.oasis.opendocument.spreadsheet"],
+    ["paparan.odp", "application/vnd.oasis.opendocument.presentation", "application/vnd.oasis.opendocument.presentation"],
+  ])("accepts a genuine Office package named %s", async (fileName, mimeType, packageMarker) => {
+    const officePackage = Buffer.concat([
+      Buffer.from("504b0304", "hex"),
+      Buffer.from(`[Content_Types].xml META-INF/manifest.xml mimetype${packageMarker}`),
+    ]);
+
+    const result = await validateAttachment(
+      attachment({ fileName, claimedMimeType: mimeType }),
+      officePackage,
+    );
+
+    expect(result.analysisKind).toBe("document");
+    expect(result.detectedMimeType).toBe(mimeType);
+  });
+
+  it("rejects a generic ZIP renamed as an Office document", async () => {
+    const renamedArchive = Buffer.concat([
+      Buffer.from("504b0304", "hex"),
+      Buffer.from("photos/image.jpg"),
+    ]);
+
+    await expect(
+      validateAttachment(
+        attachment({
+          fileName: "arsip.docx",
+          claimedMimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }),
+        renamedArchive,
+      ),
+    ).rejects.toThrow(/arsip.*zip bomb/iu);
   });
 
   it("rejects executable names and MIME-spoofed images", async () => {

@@ -1092,21 +1092,11 @@ export function createTelegramBot(
     };
   }
 
-  async function receiveAttachment(
+  async function processIncomingAttachment(
     ctx: Context,
     attachment: IncomingAttachment,
   ): Promise<void> {
     const chatId = String(ctx.chat!.id);
-    // Do not await the negative busy check: another update (/cancel or text) may
-    // otherwise interleave before the image has a coordinator identity.
-    const active = activeRequests.get(chatId);
-    if (active) {
-      await ctx.reply(
-        `Masih memproses permintaan #${active.requestId.slice(0, 8).toUpperCase()}. ` +
-          "Kirim /cancel untuk membatalkannya.",
-      );
-      return;
-    }
     const trimmedCaption = attachment.caption?.trim();
     const loader = (signal: AbortSignal) => prepareIncomingAttachment(ctx, attachment, signal);
     if (trimmedCaption) {
@@ -1179,16 +1169,38 @@ export function createTelegramBot(
     }
   }
 
+  async function receiveAttachment(
+    ctx: Context,
+    attachment: IncomingAttachment,
+  ): Promise<void> {
+    const chatId = String(ctx.chat!.id);
+    const queueWasBusy = activeRequests.has(chatId) || queuedAssistantWork.has(chatId);
+    const mustQueue = attachment.forwarded || queueWasBusy;
+    if (mustQueue) {
+      scheduleAssistantWork(chatId, () => processIncomingAttachment(ctx, attachment));
+      if (queueWasBusy) {
+        try {
+          await ctx.reply(
+            `📎 Attachment "${attachment.fileName}" ditambahkan ke antrean. ` +
+              "Bot akan mengunduh dan menyimpannya setelah proses saat ini selesai.",
+          );
+        } catch (error) {
+          logger.warn(
+            { chatId, fileName: attachment.fileName, errorMessage: safeErrorMessage(error) },
+            "Attachment queue acknowledgement failed",
+          );
+        }
+      }
+      return;
+    }
+    await processIncomingAttachment(ctx, attachment);
+  }
+
   async function dispatchAttachment(
     ctx: Context,
     attachment: IncomingAttachment,
   ): Promise<void> {
-    if (!attachment.forwarded) {
-      await receiveAttachment(ctx, attachment);
-      return;
-    }
-    const chatId = String(ctx.chat!.id);
-    scheduleAssistantWork(chatId, () => receiveAttachment(ctx, attachment));
+    await receiveAttachment(ctx, attachment);
   }
 
   bot.use(async (ctx, next) => {

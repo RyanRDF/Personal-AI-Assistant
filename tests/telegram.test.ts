@@ -643,9 +643,16 @@ describe("Telegram safety and formatting", () => {
     );
   });
 
-  it("explains that a truncated Telegram PDF must be downloaded again", async () => {
-    const assistantReply = vi.fn();
-    const saveFile = vi.fn();
+  it("stores a truncated Telegram PDF and reports that only its analysis was skipped", async () => {
+    const assistantReply = vi.fn().mockResolvedValue("PDF sudah diamankan di Vault.");
+    const saveFile = vi.fn().mockResolvedValue({
+      id: 23,
+      name: "sertifikat.pdf",
+      path: "/sertifikat.pdf",
+      detectedMimeType: "application/pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 18,
+    });
     const editedTexts: string[] = [];
     const trace = {
       requestId: "broken-pdf-request",
@@ -741,10 +748,139 @@ describe("Telegram safety and formatting", () => {
       },
     });
 
-    expect(saveFile).not.toHaveBeenCalled();
-    expect(assistantReply).not.toHaveBeenCalled();
-    expect(editedTexts).toContainEqual(expect.stringMatching(/PDF.*rusak.*Unduh ulang/iu));
+    expect(saveFile).toHaveBeenCalledOnce();
+    expect(assistantReply).toHaveBeenCalledWith(
+      "123456",
+      expect.objectContaining({
+        text: "Simpan",
+        attachmentContext: expect.objectContaining({
+          vault: { saved: true, id: 23, path: "/sertifikat.pdf" },
+          analysisWarning: expect.stringMatching(/PDF.*(?:rusak|tidak lengkap).*tersimpan/iu),
+        }),
+      }),
+      expect.any(Object),
+    );
+    expect(editedTexts).toContainEqual(expect.stringMatching(/PDF sudah diamankan[\s\S]*File tersimpan/iu));
     expect(editedTexts.join("\n")).not.toContain("Maaf, terjadi kesalahan");
+  });
+
+  it("queues a second attachment instead of dropping it while the first is processed", async () => {
+    const firstReply = deferred<string>();
+    const assistantReply = vi
+      .fn()
+      .mockImplementationOnce(() => firstReply.promise)
+      .mockResolvedValue("Attachment kedua selesai diproses.");
+    const saveFile = vi.fn(async (input: { name: string; detectedMimeType: string; bytes: Uint8Array }) => ({
+      id: input.name === "pertama.csv" ? 31 : 32,
+      name: input.name,
+      path: `/${input.name}`,
+      detectedMimeType: input.detectedMimeType,
+      mimeType: input.detectedMimeType,
+      sizeBytes: input.bytes.byteLength,
+    }));
+    const sentTexts: string[] = [];
+    let traceNumber = 0;
+    const bot = createTelegramBot(
+      testConfig({ ATTACHMENT_ANALYSIS_ENABLED: "false" }),
+      createLogger({ LOG_LEVEL: "silent" }),
+      {
+        assistant: { openaiClient: {}, reply: assistantReply },
+        conversations: {},
+        memories: {},
+        vault: { findDuplicateName: vi.fn(() => null), saveFile },
+        emailRules: {},
+        search: { available: false, name: "none" },
+        traces: {
+          start: vi.fn((chatId, model, inputKind) => ({
+            requestId: `queued-${++traceNumber}`,
+            chatId,
+            model,
+            inputKind,
+            startedAt: Date.now(),
+            stages: [],
+            tools: [],
+            inputTokens: 0,
+            outputTokens: 0,
+          })),
+          isLiveEnabled: vi.fn(() => false),
+          addStage: vi.fn(),
+          addTool: vi.fn(),
+          addUsage: vi.fn(),
+          finish: vi.fn(() => ({})),
+        },
+        telegramHistory: { record: vi.fn() },
+        gmailConfigured: false,
+      } as never,
+    );
+    bot.botInfo = {
+      id: 999,
+      is_bot: true,
+      first_name: "Test",
+      username: "test_bot",
+    } as never;
+    const csv = Buffer.from("tanggal,jumlah\n2026-08-31,1000");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(csv, {
+      status: 200,
+      headers: { "content-type": "text/csv", "content-length": String(csv.byteLength) },
+    })));
+    let messageId = 600;
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === "getFile") {
+        const fileId = String((payload as { file_id?: unknown }).file_id);
+        return {
+          ok: true,
+          result: {
+            file_id: fileId,
+            file_unique_id: `${fileId}-unique`,
+            file_size: csv.byteLength,
+            file_path: `${fileId}.csv`,
+          },
+        } as never;
+      }
+      if (method === "sendChatAction") return { ok: true, result: true } as never;
+      if (method === "sendMessage") {
+        sentTexts.push(String((payload as { text?: unknown }).text));
+      }
+      messageId += 1;
+      return {
+        ok: true,
+        result: {
+          message_id: messageId,
+          date: 1_700_000_000,
+          chat: { id: 123456, type: "private" },
+          text: "ok",
+        },
+      } as never;
+    });
+    const documentUpdate = (updateId: number, fileName: string) => ({
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        date: 1_700_000_000,
+        chat: { id: 123456, type: "private" as const, first_name: "Owner" },
+        from: { id: 123456, is_bot: false, first_name: "Owner" },
+        document: {
+          file_id: fileName.replace(".csv", ""),
+          file_unique_id: `${fileName}-unique`,
+          file_name: fileName,
+          mime_type: "text/csv",
+          file_size: csv.byteLength,
+        },
+        caption: "Simpan dan ringkas",
+      },
+    });
+
+    const firstHandling = bot.handleUpdate(documentUpdate(401, "pertama.csv"));
+    await vi.waitFor(() => expect(assistantReply).toHaveBeenCalledOnce());
+    await bot.handleUpdate(documentUpdate(402, "kedua.csv"));
+
+    expect(sentTexts.join("\n")).toMatch(/attachment.*antrean/iu);
+    expect(sentTexts.join("\n")).not.toMatch(/Masih memproses/iu);
+    firstReply.resolve("Attachment pertama selesai diproses.");
+    await firstHandling;
+    await vi.waitFor(() => expect(assistantReply).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(saveFile).toHaveBeenCalledTimes(2));
+    expect(saveFile.mock.calls.map(([input]) => input.name)).toEqual(["pertama.csv", "kedua.csv"]);
   });
 
   it("propagates deadline signals through assistant replies, typing, edits, chunks, and files", async () => {
